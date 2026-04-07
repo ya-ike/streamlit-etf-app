@@ -696,32 +696,52 @@ if not signal_df.empty:
 
     with tab3:
         st.write("採用銘柄だけ編集できます。実行有無は 〇 / × / 空欄 を想定しています。")
+        st.caption("入力途中の再描画を減らすため、下の『入力内容を反映』を押した時点で損益額・損益率・入力チェックを更新します。")
 
-        editor_df = trade_df_state.copy()
-        edited_df = st.data_editor(
-            editor_df,
-            use_container_width=True,
-            hide_index=True,
-            disabled=[
-                "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
-                "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
-            ],
-            column_config={
-                "実行有無": st.column_config.SelectboxColumn(
-                    "実行有無",
-                    options=["", "〇", "×"],
-                    required=False,
-                ),
-                "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0),
-                "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0),
-                "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0),
-                "損益率": st.column_config.NumberColumn("損益率", format="%.4f"),
-            },
-            key="trade_editor",
-        )
-        recalced_trade_df = recalc_trade_input_df(edited_df)
-        st.session_state.trade_df = recalced_trade_df
-        st.dataframe(format_display_df(recalced_trade_df), use_container_width=True, hide_index=True)
+        if trade_df_state.empty:
+            st.info("採用銘柄がないため、売買記録の入力対象がありません。")
+        else:
+            with st.form("trade_input_form"):
+                edited_df = st.data_editor(
+                    trade_df_state.copy(),
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[
+                        "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
+                        "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
+                    ],
+                    column_config={
+                        "売買日": st.column_config.TextColumn("売買日", width="small"),
+                        "日本ETFコード": st.column_config.TextColumn("日本ETFコード", width="small"),
+                        "日本ETF名": st.column_config.TextColumn("日本ETF名", width="medium"),
+                        "予定順位": st.column_config.NumberColumn("予定順位", format="%d", width="small"),
+                        "予定スコア": st.column_config.NumberColumn("予定スコア", format="%.4f"),
+                        "予定予算": st.column_config.NumberColumn("予定予算", format="¥ %.0f"),
+                        "1口金額": st.column_config.NumberColumn("1口金額", format="¥ %.0f"),
+                        "予定口数": st.column_config.NumberColumn("予定口数", format="%d"),
+                        "予定約定金額": st.column_config.NumberColumn("予定約定金額", format="¥ %.0f"),
+                        "実行有無": st.column_config.SelectboxColumn(
+                            "実行有無",
+                            options=["", "〇", "×"],
+                            required=False,
+                            width="small",
+                        ),
+                        "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0, format="¥ %.0f"),
+                        "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0, format="¥ %.0f"),
+                        "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0, format="%.0f"),
+                        "損益額": st.column_config.NumberColumn("損益額", format="¥ %.0f"),
+                        "損益率": st.column_config.NumberColumn("損益率", format="%.3f%%"),
+                        "入力チェック": st.column_config.TextColumn("入力チェック", width="small"),
+                        "メモ": st.column_config.TextColumn("メモ", width="medium"),
+                    },
+                    key="trade_editor",
+                )
+                apply_trade_edits = st.form_submit_button("入力内容を反映", type="primary", use_container_width=True)
+
+            if apply_trade_edits:
+                st.session_state.trade_df = recalc_trade_input_df(edited_df)
+                st.success("売買記録を更新しました。")
+                st.rerun()
 
     with tab4:
         excel_bytes = make_excel_download(signal_df, Daily_df, st.session_state.trade_df)
