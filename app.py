@@ -1,37 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit Community Cloud 版
-日米時差ETF戦略 試験運用アプリ 初版
+日米時差ETF戦略 / Google Sheets 保存版
 
-- 永続保存なし
-- シグナル計算
-- 日次サマリー表示
-- 候補一覧表示
-- 売買記録入力
-- CSV / Excel ダウンロード
+仕様:
+- Google Sheets を保存先に使用
+- 朝の確定計算は 1 回だけ
+- 確定後は翌日 06:00(JST) まで再計算しない
+- 夕方は保存済み候補を使って売買記録だけ更新
+- 売買記録台帳は 売買日 + 日本ETFコード で上書き保存
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
+import gspread
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+JST = ZoneInfo("Asia/Tokyo")
 
-st.set_page_config(
-    page_title="日米時差ETF戦略",
-    page_icon="📈",
-    layout="wide",
-)
+st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
-
-# -----------------------------
-# 既存ローカル版の設定を初期値として反映
-# -----------------------------
 US_ETFS = {
     "XLB": "Materials",
     "XLE": "Energy",
@@ -65,7 +60,6 @@ JP_ETFS = {
     "1632.T": "TOPIX-17 金融（除く銀行）",
     "1633.T": "TOPIX-17 不動産",
 }
-
 ALL_TICKERS = list(US_ETFS.keys()) + list(JP_ETFS.keys())
 
 DEFAULTS = {
@@ -86,18 +80,37 @@ DEFAULTS = {
     "min_suggested_qty": 1,
 }
 
+TRADE_COLS = [
+    "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算", "1口金額",
+    "予定口数", "予定約定金額", "注意フラグ", "実行有無", "買値", "売値", "口数",
+    "損益額", "損益率", "入力チェック", "メモ",
+]
+SYSTEM_KEYS = ["last_signal_date", "lock_until", "last_saved_at"]
+SHEET_TITLES = ["設定", "当日シグナル", "日次サマリー", "売買記録台帳", "システム"]
 
-# -----------------------------
-# 計算ロジック（ローカル版から移植）
-# -----------------------------
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
 def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return now_jst().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_date_str(ts) -> str:
     if pd.isna(ts):
         return ""
     return pd.Timestamp(ts).strftime("%Y-%m-%d")
+
+
+def parse_dt_or_none(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(text))
+        return dt.replace(tzinfo=JST) if dt.tzinfo is None else dt.astimezone(JST)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -120,7 +133,6 @@ def download_price_data(period: str = "2y"):
         for ticker in ALL_TICKERS:
             if ticker not in data.columns.get_level_values(0):
                 continue
-
             sub = data[ticker].copy()
             if "Close" in sub.columns:
                 close_df[ticker] = sub["Close"]
@@ -129,21 +141,19 @@ def download_price_data(period: str = "2y"):
             if "Volume" in sub.columns:
                 volume_df[ticker] = sub["Volume"]
     else:
-        if len(ALL_TICKERS) >= 1:
-            t0 = ALL_TICKERS[0]
-            if "Close" in data.columns:
-                close_df[t0] = data["Close"]
-            if "Open" in data.columns:
-                open_df[t0] = data["Open"]
-            if "Volume" in data.columns:
-                volume_df[t0] = data["Volume"]
+        t0 = ALL_TICKERS[0]
+        if "Close" in data.columns:
+            close_df[t0] = data["Close"]
+        if "Open" in data.columns:
+            open_df[t0] = data["Open"]
+        if "Volume" in data.columns:
+            volume_df[t0] = data["Volume"]
 
     return close_df.sort_index(), open_df.sort_index(), volume_df.sort_index()
 
 
 def calc_us_close_to_close_returns(close_df: pd.DataFrame) -> pd.DataFrame:
-    us_close = close_df[list(US_ETFS.keys())].copy()
-    return us_close.pct_change()
+    return close_df[list(US_ETFS.keys())].copy().pct_change()
 
 
 def calc_jp_open_to_close_returns(open_df: pd.DataFrame, close_df: pd.DataFrame) -> pd.DataFrame:
@@ -163,51 +173,31 @@ def map_jp_date_to_prev_us_date(jp_dates, us_dates):
 
 def align_us_to_jp(us_ret: pd.DataFrame, jp_ret: pd.DataFrame):
     mapping = map_jp_date_to_prev_us_date(jp_ret.index, us_ret.index)
-
     aligned_rows = []
     aligned_index = []
     for jp_date, us_date in mapping.items():
-        if pd.isna(us_date):
-            continue
-        if us_date not in us_ret.index:
+        if pd.isna(us_date) or us_date not in us_ret.index:
             continue
         aligned_rows.append(us_ret.loc[us_date].values)
         aligned_index.append(jp_date)
 
-    aligned_us = pd.DataFrame(
-        aligned_rows,
-        index=pd.DatetimeIndex(aligned_index),
-        columns=us_ret.columns,
-    )
-
+    aligned_us = pd.DataFrame(aligned_rows, index=pd.DatetimeIndex(aligned_index), columns=us_ret.columns)
     common_index = aligned_us.index.intersection(jp_ret.index)
-    aligned_us = aligned_us.loc[common_index].sort_index()
-    aligned_jp = jp_ret.loc[common_index].sort_index()
-    return aligned_us, aligned_jp
+    return aligned_us.loc[common_index].sort_index(), jp_ret.loc[common_index].sort_index()
 
 
 def get_latest_mapping_info(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame):
     if aligned_us.empty or aligned_jp.empty:
         return "", ""
-    latest_us_date = pd.Timestamp(aligned_us.index[-1]).strftime("%Y-%m-%d")
-    latest_jp_date = pd.Timestamp(aligned_jp.index[-1]).strftime("%Y-%m-%d")
-    return latest_us_date, latest_jp_date
+    return pd.Timestamp(aligned_us.index[-1]).strftime("%Y-%m-%d"), pd.Timestamp(aligned_jp.index[-1]).strftime("%Y-%m-%d")
 
 
 def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings: dict) -> pd.DataFrame:
-    min_history = settings["min_history"]
-    rolling_window = settings["rolling_window"]
-    pca_components = settings["pca_components"]
-    ridge_alpha = settings["ridge_alpha"]
-    top_n = settings["top_n"]
+    if len(aligned_us) < settings["min_history"] or len(aligned_jp) < settings["min_history"]:
+        raise ValueError(f"履歴不足です。aligned_us={len(aligned_us)}, aligned_jp={len(aligned_jp)}")
 
-    if len(aligned_us) < min_history or len(aligned_jp) < min_history:
-        raise ValueError(
-            f"履歴不足です。aligned_us={len(aligned_us)}, aligned_jp={len(aligned_jp)}"
-        )
-
-    use_us = aligned_us.iloc[-rolling_window:].copy()
-    use_jp = aligned_jp.iloc[-rolling_window:].copy()
+    use_us = aligned_us.iloc[-settings["rolling_window"]:].copy()
+    use_jp = aligned_jp.iloc[-settings["rolling_window"]:].copy()
 
     us_mean = use_us.mean(axis=0)
     us_std = use_us.std(axis=0, ddof=0).replace(0, np.nan)
@@ -215,65 +205,50 @@ def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings:
 
     x_full = us_z.copy()
     t_full, n_assets = x_full.shape
-    k = min(pca_components, n_assets, t_full)
+    k = min(settings["pca_components"], n_assets, t_full)
 
     cov = np.cov(x_full.values, rowvar=False)
     eigvals, eigvecs = np.linalg.eigh(cov)
     order = np.argsort(eigvals)[::-1]
     eigvecs = eigvecs[:, order]
-
     v = eigvecs[:, :k]
     f_full = x_full.values @ v
-
-    latest_us = x_full.iloc[-1].values.reshape(1, -1)
-    latest_factor = latest_us @ v
+    latest_factor = x_full.iloc[-1].values.reshape(1, -1) @ v
 
     scores = {}
     valid_counts = {}
-
     for jp_code in use_jp.columns:
         y_full = use_jp[jp_code].copy()
         valid_mask = y_full.notna().values
         xreg_base = f_full[valid_mask]
         y = y_full[valid_mask].values.reshape(-1, 1)
-
         valid_counts[jp_code] = int(len(y))
-
         if len(y) < max(10, k + 2):
             scores[jp_code] = 0.0
             continue
-
         xreg = np.column_stack([np.ones(len(y)), xreg_base])
-
         try:
             xtx = xreg.T @ xreg
-            reg = ridge_alpha * np.eye(xtx.shape[0])
+            reg = settings["ridge_alpha"] * np.eye(xtx.shape[0])
             reg[0, 0] = 0.0
             beta = np.linalg.solve(xtx + reg, xreg.T @ y)
             latest_x = np.column_stack([np.ones(1), latest_factor])
             pred = float((latest_x @ beta).ravel()[0])
-            if np.isnan(pred) or np.isinf(pred):
-                pred = 0.0
-            scores[jp_code] = pred
+            scores[jp_code] = 0.0 if np.isnan(pred) or np.isinf(pred) else pred
         except Exception:
             scores[jp_code] = 0.0
 
-    score_df = pd.DataFrame({
-        "jp_code": list(scores.keys()),
-        "score": list(scores.values()),
-    })
+    score_df = pd.DataFrame({"jp_code": list(scores.keys()), "score": list(scores.values())})
     score_df["valid_train_count"] = score_df["jp_code"].map(valid_counts)
-    score_df["score"] = pd.to_numeric(score_df["score"], errors="coerce").fillna(0.0)
     score_df["jp_name"] = score_df["jp_code"].map(JP_ETFS)
     score_df = score_df.sort_values("score", ascending=False).reset_index(drop=True)
     score_df["rank"] = np.arange(1, len(score_df) + 1)
-    score_df["selected"] = score_df["rank"] <= top_n
+    score_df["selected"] = score_df["rank"] <= settings["top_n"]
     return score_df
 
 
 def add_skip_flags(score_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     out = score_df.copy()
-
     if out.empty:
         out["skip_candidate"] = False
         out["skip_reason"] = ""
@@ -281,16 +256,14 @@ def add_skip_flags(score_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
         out["spread_1_4"] = np.nan
         return out
 
-    top1_score = float(out.iloc[0]["score"]) if len(out) >= 1 else 0.0
+    top1_score = float(out.iloc[0]["score"])
     top4_score = float(out.iloc[3]["score"]) if len(out) >= 4 else float(out.iloc[-1]["score"])
     spread_1_4 = top1_score - top4_score
-
     reasons = []
     if settings["skip_if_top1_leq_zero"] and top1_score <= 0:
         reasons.append("1位スコア<=0")
     if spread_1_4 < settings["min_score_spread"]:
         reasons.append("1位-4位差が小さい")
-
     out["skip_candidate"] = len(reasons) > 0
     out["skip_reason"] = "|".join(reasons)
     out["top1_score"] = top1_score
@@ -300,16 +273,13 @@ def add_skip_flags(score_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
 
 def apply_quality_filters(score_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     out = score_df.copy()
-    pass_flags = []
-    reasons = []
-
+    pass_flags, reasons = [], []
     for _, row in out.iterrows():
         reason_list = []
         score = row.get("score", np.nan)
         qty = row.get("suggested_qty", 0)
         note = str(row.get("note", "") or "")
         volume_flag = str(row.get("volume_flag", "") or "")
-
         if settings["require_positive_score"] and (pd.isna(score) or score <= 0):
             reason_list.append("スコア<=0")
         if pd.isna(qty) or qty < settings["min_suggested_qty"]:
@@ -318,70 +288,49 @@ def apply_quality_filters(score_df: pd.DataFrame, settings: dict) -> pd.DataFram
             reason_list.append("価格取得不可")
         if settings["use_volume_filter"] and volume_flag == "低出来高":
             reason_list.append("低出来高")
-
         pass_flags.append(len(reason_list) == 0)
         reasons.append("|".join(reason_list))
 
     out["フィルタ通過"] = pass_flags
     out["除外理由"] = reasons
     out["selected"] = False
-
     passed_idx = out[out["フィルタ通過"]].sort_values("score", ascending=False).head(settings["top_n"]).index
     out.loc[passed_idx, "selected"] = True
-
     out["final_rank"] = np.nan
     selected = out[out["selected"]].sort_values("score", ascending=False)
     for i, idx in enumerate(selected.index, start=1):
         out.loc[idx, "final_rank"] = i
-
     return out
 
 
 def calculate_suggested_quantity(score_df: pd.DataFrame, close_df: pd.DataFrame, volume_df: pd.DataFrame, settings: dict):
     jp_close = close_df[list(JP_ETFS.keys())].copy()
     jp_volume = volume_df[list(JP_ETFS.keys())].copy()
-
     latest_close = jp_close.ffill().iloc[-1]
     latest_volume = jp_volume.ffill().iloc[-1]
     budget_per_name = settings["total_budget"] / settings["top_n"]
 
-    est_prices = []
-    unit_prices = []
-    est_qtys = []
-    est_amounts = []
-    prev_volumes = []
-    volume_flags = []
-    alert_flags = []
-    notes = []
+    est_prices, unit_prices, est_qtys, est_amounts = [], [], [], []
+    prev_volumes, volume_flags, alert_flags, notes = [], [], [], []
 
     for _, row in score_df.iterrows():
         code = row["jp_code"]
         price = latest_close.get(code, np.nan)
         volume = latest_volume.get(code, np.nan)
-
-        qty = 0
-        amount = 0.0
-        note = ""
-        vol_flag = ""
+        qty, amount, note, vol_flag = 0, 0.0, "", ""
         alerts = []
-
         if pd.isna(price) or price <= 0:
             note = "価格取得不可"
         else:
-            qty = int(budget_per_name // (price * settings["min_price_buffer"]))
-            qty = max(qty, 0)
+            qty = max(int(budget_per_name // (price * settings["min_price_buffer"])), 0)
             amount = float(price * qty)
-
             if price < settings["low_price_threshold"]:
                 alerts.append("低単価")
             if qty > settings["high_qty_threshold"]:
                 alerts.append("口数多め")
-
-        if settings["use_volume_filter"]:
-            if pd.isna(volume) or volume < settings["min_avg_volume"]:
-                vol_flag = "低出来高"
-                alerts.append("出来高注意")
-
+        if settings["use_volume_filter"] and (pd.isna(volume) or volume < settings["min_avg_volume"]):
+            vol_flag = "低出来高"
+            alerts.append("出来高注意")
         est_prices.append(float(price) if pd.notna(price) else np.nan)
         unit_prices.append(float(price) if pd.notna(price) else np.nan)
         est_qtys.append(int(qty))
@@ -401,7 +350,6 @@ def calculate_suggested_quantity(score_df: pd.DataFrame, close_df: pd.DataFrame,
     out["volume_flag"] = volume_flags
     out["alert_flag"] = alert_flags
     out["note"] = notes
-
     out = add_skip_flags(out, settings)
     out = apply_quality_filters(out, settings)
     return out
@@ -409,11 +357,7 @@ def calculate_suggested_quantity(score_df: pd.DataFrame, close_df: pd.DataFrame,
 
 def build_signal_log_df(score_df: pd.DataFrame, aligned_jp_index, aligned_us_index, settings: dict) -> pd.DataFrame:
     signal_date = pd.Timestamp(aligned_jp_index[-1])
-    latest_us_date, latest_jp_date = get_latest_mapping_info(
-        pd.DataFrame(index=aligned_us_index),
-        pd.DataFrame(index=aligned_jp_index),
-    )
-
+    latest_us_date, latest_jp_date = get_latest_mapping_info(pd.DataFrame(index=aligned_us_index), pd.DataFrame(index=aligned_jp_index))
     out = score_df.copy().rename(columns={
         "jp_code": "日本ETFコード",
         "jp_name": "日本ETF名",
@@ -436,17 +380,15 @@ def build_signal_log_df(score_df: pd.DataFrame, aligned_jp_index, aligned_us_ind
         "top1_score": "1位スコア",
         "spread_1_4": "1位-4位差",
     })
-
     out.insert(0, "実行時刻", now_text())
     out.insert(1, "シグナル日付", to_date_str(signal_date))
     out.insert(2, "使用米国日付", latest_us_date)
     out.insert(3, "使用日本日付", latest_jp_date)
     out.insert(4, "計算方式", "pca_regression")
     out.insert(5, "PCA主成分数", settings["pca_components"])
-
     cols = [
-        "実行時刻", "シグナル日付", "使用米国日付", "使用日本日付", "計算方式", "PCA主成分数",
-        "有効学習件数", "見送り候補", "見送り理由", "1位スコア", "1位-4位差", "フィルタ通過", "除外理由",
+        "実行時刻", "シグナル日付", "使用米国日付", "使用日本日付", "計算方式", "PCA主成分数", "有効学習件数",
+        "見送り候補", "見送り理由", "1位スコア", "1位-4位差", "フィルタ通過", "除外理由",
         "日本ETFコード", "日本ETF名", "スコア", "順位", "最終順位", "採用", "推奨予算", "推定価格",
         "1口金額", "推奨口数", "推奨約定金額", "前日出来高", "出来高フラグ", "注意フラグ", "備考",
     ]
@@ -456,19 +398,15 @@ def build_signal_log_df(score_df: pd.DataFrame, aligned_jp_index, aligned_us_ind
 def build_daily_summary_df(signal_df: pd.DataFrame) -> pd.DataFrame:
     if signal_df.empty:
         return pd.DataFrame()
-
     first_row = signal_df.iloc[0]
     selected_df = signal_df[signal_df["採用"] == True].copy()
     passed_df = signal_df[signal_df["フィルタ通過"] == True].copy()
-
     code_list = selected_df["日本ETFコード"].tolist()
     name_list = selected_df["日本ETF名"].tolist()
-
     while len(code_list) < 3:
         code_list.append("")
     while len(name_list) < 3:
         name_list.append("")
-
     return pd.DataFrame([{
         "実行時刻": first_row["実行時刻"],
         "シグナル日付": first_row["シグナル日付"],
@@ -492,15 +430,43 @@ def build_daily_summary_df(signal_df: pd.DataFrame) -> pd.DataFrame:
     }])
 
 
+def ensure_trade_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    num_cols = ["予定順位", "予定スコア", "予定予算", "1口金額", "予定口数", "予定約定金額", "買値", "売値", "口数", "損益額", "損益率"]
+    for col in TRADE_COLS:
+        if col not in out.columns:
+            out[col] = np.nan if col in num_cols else ""
+    return out[TRADE_COLS]
+
+
+def recalc_trade_input_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = ensure_trade_columns(df)
+    if out.empty:
+        return out
+    for col in ["買値", "売値", "口数"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    pnl, pnl_pct, checks = [], [], []
+    for _, row in out.iterrows():
+        exec_flag = str(row.get("実行有無", "") or "")
+        buy, sell, qty = row.get("買値", np.nan), row.get("売値", np.nan), row.get("口数", np.nan)
+        if exec_flag == "×":
+            pnl.append(np.nan); pnl_pct.append(np.nan); checks.append("不要")
+        elif pd.isna(buy) or pd.isna(sell) or pd.isna(qty):
+            pnl.append(np.nan); pnl_pct.append(np.nan); checks.append("未入力")
+        else:
+            trade_pnl = (sell - buy) * qty
+            trade_pct = np.nan if buy == 0 else (sell - buy) / buy
+            pnl.append(trade_pnl); pnl_pct.append(trade_pct); checks.append("OK")
+    out["損益額"] = pnl
+    out["損益率"] = pnl_pct
+    out["入力チェック"] = checks
+    return ensure_trade_columns(out)
+
+
 def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
     selected_df = signal_df[signal_df["採用"] == True].copy()
     if selected_df.empty:
-        return pd.DataFrame(columns=[
-            "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算", "1口金額",
-            "予定口数", "予定約定金額", "注意フラグ", "実行有無", "買値", "売値", "口数",
-            "損益額", "損益率", "入力チェック", "メモ",
-        ])
-
+        return pd.DataFrame(columns=TRADE_COLS)
     trade_df = pd.DataFrame({
         "売買日": selected_df["シグナル日付"],
         "日本ETFコード": selected_df["日本ETFコード"],
@@ -524,63 +490,178 @@ def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
     return recalc_trade_input_df(trade_df)
 
 
-def recalc_trade_input_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        return out
+def trade_key_series(df: pd.DataFrame) -> pd.Series:
+    work = ensure_trade_columns(df)
+    dates = pd.to_datetime(work["売買日"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    codes = work["日本ETFコード"].fillna("").astype(str)
+    return dates + "|" + codes
 
-    for col in ["買値", "売値", "口数"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    pnl = []
-    pnl_pct = []
-    checks = []
+def merge_trade_ledger(base_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    base = recalc_trade_input_df(base_df)
+    new = recalc_trade_input_df(new_df)
+    if base.empty:
+        merged = new.copy()
+    else:
+        base["_k"] = trade_key_series(base)
+        new["_k"] = trade_key_series(new)
+        merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["_k"], keep="last")
+        merged = merged.drop(columns=["_k"], errors="ignore")
+    merged["_sort"] = pd.to_datetime(merged["売買日"], errors="coerce")
+    merged = merged.sort_values(["_sort", "予定順位", "日本ETFコード"], na_position="last").drop(columns=["_sort"], errors="ignore")
+    return recalc_trade_input_df(merged).reset_index(drop=True)
 
-    for _, row in out.iterrows():
-        exec_flag = str(row.get("実行有無", "") or "")
-        buy = row.get("買値", np.nan)
-        sell = row.get("売値", np.nan)
-        qty = row.get("口数", np.nan)
 
-        if exec_flag == "×":
-            pnl.append(np.nan)
-            pnl_pct.append(np.nan)
-            checks.append("不要")
-        elif pd.isna(buy) or pd.isna(sell) or pd.isna(qty):
-            pnl.append(np.nan)
-            pnl_pct.append(np.nan)
-            checks.append("未入力")
-        else:
-            trade_pnl = (sell - buy) * qty
-            trade_pct = np.nan if buy == 0 else (sell - buy) / buy
-            pnl.append(trade_pnl)
-            pnl_pct.append(trade_pct)
-            checks.append("OK")
-
-    out["損益額"] = pnl
-    out["損益率"] = pnl_pct
-    out["入力チェック"] = checks
-    return out
+def insert_blank_rows_by_date(df: pd.DataFrame, date_col: str = "売買日") -> pd.DataFrame:
+    if df.empty or date_col not in df.columns:
+        return df
+    rows = []
+    prev = None
+    for _, row in df.iterrows():
+        cur = row.get(date_col)
+        if prev is not None and cur != prev:
+            rows.append({c: "" for c in df.columns})
+        rows.append(row.to_dict())
+        prev = cur
+    return pd.DataFrame(rows, columns=df.columns)
 
 
 def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    num4_cols = ["スコア", "予定スコア", "1位スコア", "1位-4位差"]
-    yen_cols = ["推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"]
-    int_cols = ["順位", "最終順位", "推奨口数", "前日出来高", "予定順位", "予定口数", "口数", "有効学習件数", "フィルタ通過本数", "最終採用本数"]
-
-    for col in num4_cols:
+    for col in ["スコア", "予定スコア", "1位スコア", "1位-4位差"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(4)
+    yen_cols = ["推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"]
     for col in yen_cols:
         if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(0)
-    for col in int_cols:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
+            vals = pd.to_numeric(out[col], errors="coerce")
+            out[col] = vals.apply(lambda x: "" if pd.isna(x) else f"¥{x:,.0f}")
     if "損益率" in out.columns:
-        out["損益率(%)"] = pd.to_numeric(out["損益率"], errors="coerce") * 100
+        vals = pd.to_numeric(out["損益率"], errors="coerce")
+        out["損益率"] = vals.apply(lambda x: "" if pd.isna(x) else f"{x * 100:.3f}%")
     return out
+
+
+# -----------------------------
+# Google Sheets helpers
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Secrets に [gcp_service_account] がありません。")
+    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+
+
+@st.cache_resource(show_spinner=False)
+def open_workbook():
+    client = get_gspread_client()
+    sheet_name = st.secrets.get("sheets", {}).get("spreadsheet_name", "ETF_運用台帳")
+    return client.open(sheet_name)
+
+
+def get_or_create_ws(book, title: str):
+    try:
+        return book.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return book.add_worksheet(title=title, rows=200, cols=40)
+
+
+def read_ws_df(title: str) -> pd.DataFrame:
+    ws = get_or_create_ws(open_workbook(), title)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    headers = values[0]
+    rows = values[1:]
+    if not headers:
+        return pd.DataFrame()
+    clean_rows = [r + [""] * max(0, len(headers) - len(r)) for r in rows]
+    return pd.DataFrame(clean_rows, columns=headers)
+
+
+def write_ws_df(title: str, df: pd.DataFrame):
+    ws = get_or_create_ws(open_workbook(), title)
+    ws.clear()
+    if df is None or df.empty:
+        return
+    clean = df.fillna("").astype(str)
+    data = [clean.columns.tolist()] + clean.values.tolist()
+    ws.update(data)
+
+
+def append_or_replace_rows(title: str, new_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    base = read_ws_df(title)
+    if base.empty:
+        merged = new_df.copy()
+    else:
+        base = base.copy()
+        new = new_df.copy()
+        base["_k"] = base[key_cols].fillna("").astype(str).agg("|".join, axis=1)
+        new["_k"] = new[key_cols].fillna("").astype(str).agg("|".join, axis=1)
+        merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["_k"], keep="last")
+        merged = merged.drop(columns=["_k"], errors="ignore")
+    write_ws_df(title, merged)
+    return merged
+
+
+def load_system_map() -> dict:
+    df = read_ws_df("システム")
+    if df.empty or "key" not in df.columns or "value" not in df.columns:
+        sys_df = pd.DataFrame({"key": SYSTEM_KEYS, "value": ["", "", ""]})
+        write_ws_df("システム", sys_df)
+        return {k: "" for k in SYSTEM_KEYS}
+    out = {str(r["key"]): str(r["value"]) for _, r in df.iterrows()}
+    for k in SYSTEM_KEYS:
+        out.setdefault(k, "")
+    return out
+
+
+def save_system_map(sys_map: dict):
+    df = pd.DataFrame({"key": list(sys_map.keys()), "value": [sys_map[k] for k in sys_map.keys()]})
+    write_ws_df("システム", df)
+
+
+def save_settings_sheet(settings: dict):
+    df = pd.DataFrame({"項目": list(settings.keys()), "値": list(settings.values())})
+    write_ws_df("設定", df)
+
+
+def save_signal_bundle(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame, settings: dict, signal_date: str):
+    write_ws_df("当日シグナル", signal_df)
+    append_or_replace_rows("日次サマリー", daily_df, ["シグナル日付"])
+    ledger_df = read_ws_df("売買記録台帳")
+    merged_ledger = merge_trade_ledger(ledger_df, trade_df)
+    write_ws_df("売買記録台帳", merged_ledger)
+    save_settings_sheet(settings)
+
+    lock_until = datetime.combine((now_jst() + timedelta(days=1)).date(), datetime.min.time(), tzinfo=JST).replace(hour=6)
+    sys_map = load_system_map()
+    sys_map["last_signal_date"] = signal_date
+    sys_map["lock_until"] = lock_until.isoformat(timespec="minutes")
+    sys_map["last_saved_at"] = now_text()
+    save_system_map(sys_map)
+
+
+def load_saved_state_from_sheets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    sys_map = load_system_map()
+    signal_df = read_ws_df("当日シグナル")
+    daily_all = read_ws_df("日次サマリー")
+    ledger_df = read_ws_df("売買記録台帳")
+    signal_date = sys_map.get("last_signal_date", "")
+
+    if signal_date and not daily_all.empty and "シグナル日付" in daily_all.columns:
+        daily_df = daily_all[daily_all["シグナル日付"].astype(str) == str(signal_date)].copy()
+        if daily_df.empty:
+            daily_df = daily_all.tail(1).copy()
+    else:
+        daily_df = daily_all.tail(1).copy() if not daily_all.empty else pd.DataFrame()
+
+    if signal_date and not ledger_df.empty and "売買日" in ledger_df.columns:
+        trade_df = ledger_df[ledger_df["売買日"].astype(str) == str(signal_date)].copy()
+    else:
+        trade_df = pd.DataFrame(columns=TRADE_COLS)
+
+    return signal_df, daily_df, recalc_trade_input_df(trade_df), sys_map
 
 
 def make_excel_download(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame) -> bytes:
@@ -597,11 +678,20 @@ def make_csv_download(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def is_locked(sys_map: dict) -> tuple[bool, str]:
+    last_signal_date = sys_map.get("last_signal_date", "")
+    lock_until_text = sys_map.get("lock_until", "")
+    lock_dt = parse_dt_or_none(lock_until_text)
+    if lock_dt and now_jst() < lock_dt:
+        return True, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロック: {lock_dt.strftime('%Y-%m-%d %H:%M')} JST まで"
+    return False, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロックなし"
+
+
 # -----------------------------
 # UI
 # -----------------------------
-st.title("日米時差ETF戦略 / Streamlit試験版")
-st.caption("PCA回帰ベース・永続保存なし・Androidタブレットのブラウザ利用を想定")
+st.title("日米時差ETF戦略 / Google Sheets 保存版")
+st.caption("朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しない運用を想定")
 
 with st.sidebar:
     st.subheader("設定")
@@ -614,7 +704,8 @@ with st.sidebar:
     use_volume_filter = st.checkbox("出来高フィルタを使う", value=DEFAULTS["use_volume_filter"])
     require_positive_score = st.checkbox("スコア>0のみ採用", value=DEFAULTS["require_positive_score"])
     min_suggested_qty = st.number_input("最小推奨口数", min_value=1, max_value=1000, value=DEFAULTS["min_suggested_qty"], step=1)
-    run_button = st.button("シグナル計算を実行", type="primary", use_container_width=True)
+    reload_button = st.button("保存済みデータを再読込", use_container_width=True)
+    run_button = st.button("朝の確定計算を実行", type="primary", use_container_width=True)
 
 settings = {
     **DEFAULTS,
@@ -629,167 +720,147 @@ settings = {
     "min_suggested_qty": int(min_suggested_qty),
 }
 
-if "signal_df" not in st.session_state:
-    st.session_state.signal_df = pd.DataFrame()
-if "daily_df" not in st.session_state:
-    st.session_state.daily_df = pd.DataFrame()
-if "trade_df" not in st.session_state:
-    st.session_state.trade_df = pd.DataFrame()
-if "latest_close_df" not in st.session_state:
-    st.session_state.latest_close_df = pd.DataFrame()
+for key, default in {
+    "signal_df": pd.DataFrame(),
+    "daily_df": pd.DataFrame(),
+    "trade_df": pd.DataFrame(columns=TRADE_COLS),
+    "system_map": {k: "" for k in SYSTEM_KEYS},
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# initial load / reload
+if reload_button or st.session_state["signal_df"].empty:
+    try:
+        signal_df, daily_df, trade_df, sys_map = load_saved_state_from_sheets()
+        st.session_state["signal_df"] = signal_df
+        st.session_state["daily_df"] = daily_df
+        st.session_state["trade_df"] = trade_df
+        st.session_state["system_map"] = sys_map
+        if reload_button:
+            st.success("Google Sheets の保存済みデータを再読込しました。")
+    except Exception as e:
+        st.error(f"Google Sheets 読込エラー: {e}")
+
+system_map = st.session_state["system_map"]
+locked, lock_text = is_locked(system_map)
+st.info(lock_text)
 
 if run_button:
-    try:
-        with st.spinner("価格データ取得・計算中..."):
-            close_df, open_df, volume_df = download_price_data(period="2y")
-            if close_df.empty or open_df.empty:
-                raise RuntimeError("価格データ取得に失敗しました。")
+    if locked:
+        st.warning("今回は再計算しません。保存済みデータをそのまま使ってください。テスト時は Google Sheets の『システム』シートで lock_until を過去日時へ変更してください。")
+    else:
+        try:
+            with st.spinner("朝の確定計算を実行して Google Sheets へ保存中..."):
+                close_df, open_df, volume_df = download_price_data(period="2y")
+                if close_df.empty or open_df.empty:
+                    raise RuntimeError("価格データ取得に失敗しました。")
+                us_ret = calc_us_close_to_close_returns(close_df)
+                jp_ret = calc_jp_open_to_close_returns(open_df, close_df)
+                aligned_us, aligned_jp = align_us_to_jp(us_ret, jp_ret)
+                if aligned_us.empty or aligned_jp.empty:
+                    raise RuntimeError("日米営業日の対応付けに失敗しました。")
+                score_df = compute_scores(aligned_us, aligned_jp, settings)
+                score_df = calculate_suggested_quantity(score_df, close_df, volume_df, settings)
+                signal_df = build_signal_log_df(score_df, aligned_jp.index, aligned_us.index, settings)
+                daily_df = build_daily_summary_df(signal_df)
+                trade_df = build_trade_input_df(signal_df)
+                signal_date = str(daily_df.iloc[0]["シグナル日付"])
+                save_signal_bundle(signal_df, daily_df, trade_df, settings, signal_date)
+                signal_df, daily_df, trade_df, sys_map = load_saved_state_from_sheets()
 
-            us_ret = calc_us_close_to_close_returns(close_df)
-            jp_ret = calc_jp_open_to_close_returns(open_df, close_df)
-            aligned_us, aligned_jp = align_us_to_jp(us_ret, jp_ret)
-            if aligned_us.empty or aligned_jp.empty:
-                raise RuntimeError("日米営業日の対応付けに失敗しました。")
+            st.session_state["signal_df"] = signal_df
+            st.session_state["daily_df"] = daily_df
+            st.session_state["trade_df"] = trade_df
+            st.session_state["system_map"] = sys_map
+            st.success("朝の確定計算を保存しました。翌日06:00(JST)まで再計算しません。")
+            st.rerun()
+        except Exception as e:
+            st.error(f"朝の確定計算エラー: {e}")
 
-            score_df = compute_scores(aligned_us, aligned_jp, settings)
-            score_df = calculate_suggested_quantity(score_df, close_df, volume_df, settings)
-            signal_df = build_signal_log_df(score_df, aligned_jp.index, aligned_us.index, settings)
-            daily_df = build_daily_summary_df(signal_df)
-            trade_df = build_trade_input_df(signal_df)
-
-        st.session_state.signal_df = signal_df
-        st.session_state.daily_df = daily_df
-        st.session_state.trade_df = trade_df
-        st.session_state.latest_close_df = close_df.tail(5)
-        st.success("計算が完了しました。")
-    except Exception as e:
-        st.error(f"エラー: {e}")
-
-signal_df = st.session_state.signal_df
-Daily_df = st.session_state.daily_df
-trade_df_state = st.session_state.trade_df
+signal_df = st.session_state["signal_df"]
+daily_df = st.session_state["daily_df"]
+trade_df_state = recalc_trade_input_df(st.session_state["trade_df"])
 
 if not signal_df.empty:
-    summary_row = Daily_df.iloc[0]
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("シグナル日付", str(summary_row["シグナル日付"]))
-    col2.metric("フィルタ通過本数", int(summary_row["フィルタ通過本数"]))
-    col3.metric("最終採用本数", int(summary_row["最終採用本数"]))
-    col4.metric("見送り候補", "はい" if bool(summary_row["見送り候補"]) else "いいえ")
+    summary_row = daily_df.iloc[0] if not daily_df.empty else pd.Series(dtype=object)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("シグナル日付", str(summary_row.get("シグナル日付", "")))
+    c2.metric("フィルタ通過本数", int(pd.to_numeric(summary_row.get("フィルタ通過本数", 0), errors="coerce") or 0))
+    c3.metric("最終採用本数", int(pd.to_numeric(summary_row.get("最終採用本数", 0), errors="coerce") or 0))
+    c4.metric("見送り候補", "はい" if str(summary_row.get("見送り候補", "False")).lower() in ["true", "1"] else "いいえ")
 
-    if bool(summary_row["見送り候補"]):
-        st.warning(f"見送り候補です。理由: {summary_row['見送り理由']}")
+    tabs = st.tabs(["日次サマリー", "候補一覧", "売買記録入力", "ダウンロード"])
 
-    tab1, tab2, tab3, tab4 = st.tabs(["日次サマリー", "候補一覧", "売買記録入力", "ダウンロード"])
+    with tabs[0]:
+        st.dataframe(format_display_df(daily_df), use_container_width=True, hide_index=True)
 
-    with tab1:
-        st.dataframe(format_display_df(Daily_df), use_container_width=True, hide_index=True)
-
-    with tab2:
+    with tabs[1]:
         view_cols = [
             "見送り候補", "見送り理由", "フィルタ通過", "除外理由", "日本ETFコード", "日本ETF名",
             "スコア", "順位", "最終順位", "採用", "推奨予算", "1口金額", "推奨口数", "推奨約定金額",
             "注意フラグ", "備考",
         ]
-        candidate_view = signal_df[view_cols].copy()
-        st.dataframe(format_display_df(candidate_view), use_container_width=True, hide_index=True)
+        st.dataframe(format_display_df(signal_df[view_cols].copy()), use_container_width=True, hide_index=True)
 
-    with tab3:
-        st.write("採用銘柄だけ編集できます。実行有無は 〇 / × / 空欄 を想定しています。")
-        st.caption("入力途中の再描画を減らすため、下の『入力内容を反映』を押した時点で損益額・損益率・入力チェックを更新します。")
-
-        if trade_df_state.empty:
-            st.info("採用銘柄がないため、売買記録の入力対象がありません。")
-        else:
-            with st.form("trade_input_form"):
-                edited_df = st.data_editor(
-                    trade_df_state.copy(),
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=[
-                        "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
-                        "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
-                    ],
-                    column_config={
-                        "売買日": st.column_config.TextColumn("売買日", width="small"),
-                        "日本ETFコード": st.column_config.TextColumn("日本ETFコード", width="small"),
-                        "日本ETF名": st.column_config.TextColumn("日本ETF名", width="medium"),
-                        "予定順位": st.column_config.NumberColumn("予定順位", format="%d", width="small"),
-                        "予定スコア": st.column_config.NumberColumn("予定スコア", format="%.4f"),
-                        "予定予算": st.column_config.NumberColumn("予定予算", format="¥ %.0f"),
-                        "1口金額": st.column_config.NumberColumn("1口金額", format="¥ %.0f"),
-                        "予定口数": st.column_config.NumberColumn("予定口数", format="%d"),
-                        "予定約定金額": st.column_config.NumberColumn("予定約定金額", format="¥ %.0f"),
-                        "実行有無": st.column_config.SelectboxColumn(
-                            "実行有無",
-                            options=["", "〇", "×"],
-                            required=False,
-                            width="small",
-                        ),
-                        "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0, format="¥ %.0f"),
-                        "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0, format="¥ %.0f"),
-                        "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0, format="%.0f"),
-                        "損益額": st.column_config.NumberColumn("損益額", format="¥ %.0f"),
-                        "損益率": st.column_config.NumberColumn("損益率", format="%.3f%%"),
-                        "入力チェック": st.column_config.TextColumn("入力チェック", width="small"),
-                        "メモ": st.column_config.TextColumn("メモ", width="medium"),
-                    },
-                    key="trade_editor",
-                )
-                apply_trade_edits = st.form_submit_button("入力内容を反映", type="primary", use_container_width=True)
-
-            if apply_trade_edits:
-                st.session_state.trade_df = recalc_trade_input_df(edited_df)
-                st.success("売買記録を更新しました。")
+    with tabs[2]:
+        st.write("夕方〜夜はここで買値・売値・口数を入力し、Google Sheets の売買記録台帳へ保存します。")
+        base_trade_df = recalc_trade_input_df(trade_df_state.copy())
+        edited_df = st.data_editor(
+            base_trade_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
+                "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
+            ],
+            column_config={
+                "実行有無": st.column_config.SelectboxColumn("実行有無", options=["", "〇", "×"], required=False),
+                "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0, format="¥%.0f"),
+                "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0, format="¥%.0f"),
+                "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0, format="%.0f"),
+                "損益額": st.column_config.NumberColumn("損益額", format="¥%.0f"),
+                "損益率": st.column_config.NumberColumn("損益率", format="%.4f"),
+            },
+            key="trade_editor",
+        )
+        if st.button("入力内容を反映して Google Sheets へ保存", use_container_width=True):
+            try:
+                new_trade_df = recalc_trade_input_df(edited_df)
+                ledger_df = read_ws_df("売買記録台帳")
+                merged = merge_trade_ledger(ledger_df, new_trade_df)
+                write_ws_df("売買記録台帳", merged)
+                st.session_state["trade_df"] = new_trade_df
+                st.success("売買記録台帳へ保存しました。")
                 st.rerun()
+            except Exception as e:
+                st.error(f"売買記録保存エラー: {e}")
 
-    with tab4:
-        excel_bytes = make_excel_download(signal_df, Daily_df, st.session_state.trade_df)
-        signal_csv = make_csv_download(signal_df)
-        daily_csv = make_csv_download(Daily_df)
-        trade_csv = make_csv_download(st.session_state.trade_df)
-        signal_date = str(Daily_df.iloc[0]["シグナル日付"])
+    with tabs[3]:
+        excel_bytes = make_excel_download(signal_df, daily_df, trade_df_state)
+        signal_date = str(daily_df.iloc[0]["シグナル日付"]) if not daily_df.empty else now_jst().strftime("%Y-%m-%d")
+        st.download_button(
+            "当日Excelダウンロード",
+            data=excel_bytes,
+            file_name=f"etf_signal_{signal_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.download_button(
+            "当日売買記録CSV",
+            data=make_csv_download(trade_df_state),
+            file_name=f"trade_input_{signal_date}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Excelダウンロード",
-                data=excel_bytes,
-                file_name=f"etf_signal_{signal_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            st.download_button(
-                "予測記録CSV",
-                data=signal_csv,
-                file_name=f"signal_{signal_date}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with c2:
-            st.download_button(
-                "日次サマリーCSV",
-                data=daily_csv,
-                file_name=f"daily_summary_{signal_date}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.download_button(
-                "売買記録CSV",
-                data=trade_csv,
-                file_name=f"trade_input_{signal_date}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    with st.expander("テスト時の再計算解除方法"):
+        st.markdown(
+            """
+- Google Sheets の **システム** シートで `lock_until` を過去日時へ変更します。
+- もしくは `last_signal_date` を空欄にします。
+- その後、アプリで **保存済みデータを再読込** を押してから **朝の確定計算を実行** してください。
+            """
+        )
 else:
-    st.info("左のサイドバーから『シグナル計算を実行』を押してください。")
-
-with st.expander("この試験版の位置づけ"):
-    st.markdown(
-        """
-- この初版は **永続保存なし** です。
-- 毎回その場でデータ取得・計算を行い、結果を画面表示します。
-- 売買記録は画面上で入力できますが、Community Cloud 側には保存されません。
-- 必要なときに Excel / CSV をダウンロードして、ローカル台帳へ取り込む前提です。
-        """
-    )
+    st.info("左のサイドバーから **保存済みデータを再読込**、または **朝の確定計算を実行** を押してください。")
