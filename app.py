@@ -88,26 +88,6 @@ TRADE_COLS = [
 SYSTEM_KEYS = ["last_signal_date", "lock_until", "last_saved_at"]
 SHEET_TITLES = ["設定", "当日シグナル", "日次サマリー", "売買記録台帳", "システム"]
 
-NUMERIC_COLS_BY_SHEET = {
-    "当日シグナル": [
-        "PCA主成分数", "有効学習件数", "1位スコア", "1位-4位差", "スコア",
-        "順位", "最終順位", "推奨予算", "推定価格", "1口金額", "推奨口数",
-        "推奨約定金額", "前日出来高",
-    ],
-    "日次サマリー": [
-        "PCA主成分数", "1位スコア", "1位-4位差", "フィルタ通過本数", "最終採用本数",
-    ],
-    "売買記録台帳": [
-        "予定順位", "予定スコア", "予定予算", "1口金額", "予定口数", "予定約定金額",
-        "買値", "売値", "口数", "損益額", "損益率",
-    ],
-}
-YEN_COLS = {"推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"}
-PERCENT_COLS = {"損益率"}
-LIGHT_BLUE = {"red": 0.918, "green": 0.953, "blue": 1.0}
-WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
-
-
 
 def now_jst() -> datetime:
     return datetime.now(JST)
@@ -122,6 +102,29 @@ def to_date_str(ts) -> str:
         return ""
     return pd.Timestamp(ts).strftime("%Y-%m-%d")
 
+
+
+
+def normalize_date_like(val) -> str:
+    """
+    日付文字列を集計・キー用に正規化する。
+    例:
+    - 2026-04-08
+    - 2026/04/08
+    - 2026-04-08 16:23:35
+    - 2026/04/08 16:23:35
+    をすべて YYYY-MM-DD にそろえる
+    """
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if s == "" or s.lower() == "none":
+        return ""
+    s = s.replace("/", "-").replace(".", "-")
+    ts = pd.to_datetime(s, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return pd.Timestamp(ts).strftime("%Y-%m-%d")
 
 def parse_dt_or_none(text: str | None) -> datetime | None:
     if not text:
@@ -512,8 +515,8 @@ def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
 
 def trade_key_series(df: pd.DataFrame) -> pd.Series:
     work = ensure_trade_columns(df)
-    dates = pd.to_datetime(work["売買日"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    codes = work["日本ETFコード"].fillna("").astype(str)
+    dates = work["売買日"].apply(normalize_date_like)
+    codes = work["日本ETFコード"].fillna("").astype(str).str.strip()
     return dates + "|" + codes
 
 
@@ -599,91 +602,14 @@ def read_ws_df(title: str) -> pd.DataFrame:
     return pd.DataFrame(clean_rows, columns=headers)
 
 
-def normalize_df_for_sheet(title: str, df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in NUMERIC_COLS_BY_SHEET.get(title, []):
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
-
-
-def _make_repeat_cell_request(sheet_id: int, start_row: int, end_row: int, start_col: int, end_col: int, cell_format: dict, fields: str) -> dict:
-    return {
-        "repeatCell": {
-            "range": {
-                "sheetId": sheet_id,
-                "startRowIndex": start_row,
-                "endRowIndex": end_row,
-                "startColumnIndex": start_col,
-                "endColumnIndex": end_col,
-            },
-            "cell": {"userEnteredFormat": cell_format},
-            "fields": fields,
-        }
-    }
-
-
-def apply_ws_formatting(title: str, df: pd.DataFrame):
-    if df is None or df.empty:
-        return
-    ws = get_or_create_ws(open_workbook(), title)
-    requests = []
-    row_count = len(df)
-    headers = list(df.columns)
-    header_to_idx = {h: i for i, h in enumerate(headers)}
-
-    for col in headers:
-        if col in YEN_COLS:
-            requests.append(
-                _make_repeat_cell_request(
-                    ws.id, 1, row_count + 1, header_to_idx[col], header_to_idx[col] + 1,
-                    {"numberFormat": {"type": "CURRENCY", "pattern": "¥#,##0"}},
-                    "userEnteredFormat.numberFormat",
-                )
-            )
-        elif col in PERCENT_COLS:
-            requests.append(
-                _make_repeat_cell_request(
-                    ws.id, 1, row_count + 1, header_to_idx[col], header_to_idx[col] + 1,
-                    {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}},
-                    "userEnteredFormat.numberFormat",
-                )
-            )
-
-    if title == "売買記録台帳" and "売買日" in df.columns:
-        dates = pd.to_datetime(df["売買日"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-        group_start = 0
-        alt = False
-        prev = dates.iloc[0] if len(dates) else None
-        for i in range(1, len(dates) + 1):
-            current = dates.iloc[i] if i < len(dates) else None
-            if i == len(dates) or current != prev:
-                color = LIGHT_BLUE if alt else WHITE
-                requests.append(
-                    _make_repeat_cell_request(
-                        ws.id, group_start + 1, i + 1, 0, len(headers),
-                        {"backgroundColor": color},
-                        "userEnteredFormat.backgroundColor",
-                    )
-                )
-                group_start = i
-                prev = current
-                alt = not alt
-
-    if requests:
-        ws.spreadsheet.batch_update({"requests": requests})
-
-
 def write_ws_df(title: str, df: pd.DataFrame):
     ws = get_or_create_ws(open_workbook(), title)
     ws.clear()
     if df is None or df.empty:
         return
-    clean = normalize_df_for_sheet(title, df)
-    clean = clean.where(pd.notna(clean), "")
+    clean = df.fillna("").astype(str)
     data = [clean.columns.tolist()] + clean.values.tolist()
-    ws.update(data, value_input_option="USER_ENTERED")
-    apply_ws_formatting(title, clean)
+    ws.update(data)
 
 
 def append_or_replace_rows(title: str, new_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
@@ -733,7 +659,7 @@ def save_signal_bundle(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df
 
     lock_until = datetime.combine((now_jst() + timedelta(days=1)).date(), datetime.min.time(), tzinfo=JST).replace(hour=6)
     sys_map = load_system_map()
-    sys_map["last_signal_date"] = signal_date
+    sys_map["last_signal_date"] = normalize_date_like(signal_date)
     sys_map["lock_until"] = lock_until.isoformat(timespec="minutes")
     sys_map["last_saved_at"] = now_text()
     save_system_map(sys_map)
@@ -744,17 +670,23 @@ def load_saved_state_from_sheets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
     signal_df = read_ws_df("当日シグナル")
     daily_all = read_ws_df("日次サマリー")
     ledger_df = read_ws_df("売買記録台帳")
-    signal_date = sys_map.get("last_signal_date", "")
+    signal_date = normalize_date_like(sys_map.get("last_signal_date", ""))
 
-    if signal_date and not daily_all.empty and "シグナル日付" in daily_all.columns:
-        daily_df = daily_all[daily_all["シグナル日付"].astype(str) == str(signal_date)].copy()
+    if not daily_all.empty and "シグナル日付" in daily_all.columns:
+        daily_all["_sig_key"] = daily_all["シグナル日付"].apply(normalize_date_like)
+    if signal_date and not daily_all.empty and "_sig_key" in daily_all.columns:
+        daily_df = daily_all[daily_all["_sig_key"] == signal_date].copy()
+        daily_df = daily_df.drop(columns=["_sig_key"], errors="ignore")
         if daily_df.empty:
             daily_df = daily_all.tail(1).copy()
     else:
         daily_df = daily_all.tail(1).copy() if not daily_all.empty else pd.DataFrame()
 
-    if signal_date and not ledger_df.empty and "売買日" in ledger_df.columns:
-        trade_df = ledger_df[ledger_df["売買日"].astype(str) == str(signal_date)].copy()
+    if not ledger_df.empty and "売買日" in ledger_df.columns:
+        ledger_df["_trade_key_date"] = ledger_df["売買日"].apply(normalize_date_like)
+    if signal_date and not ledger_df.empty and "_trade_key_date" in ledger_df.columns:
+        trade_df = ledger_df[ledger_df["_trade_key_date"] == signal_date].copy()
+        trade_df = trade_df.drop(columns=["_trade_key_date"], errors="ignore")
     else:
         trade_df = pd.DataFrame(columns=TRADE_COLS)
 
@@ -862,7 +794,7 @@ if run_button:
                 signal_df = build_signal_log_df(score_df, aligned_jp.index, aligned_us.index, settings)
                 daily_df = build_daily_summary_df(signal_df)
                 trade_df = build_trade_input_df(signal_df)
-                signal_date = str(daily_df.iloc[0]["シグナル日付"])
+                signal_date = normalize_date_like(daily_df.iloc[0]["シグナル日付"])
                 save_signal_bundle(signal_df, daily_df, trade_df, settings, signal_date)
                 signal_df, daily_df, trade_df, sys_map = load_saved_state_from_sheets()
 
