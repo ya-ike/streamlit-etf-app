@@ -88,6 +88,26 @@ TRADE_COLS = [
 SYSTEM_KEYS = ["last_signal_date", "lock_until", "last_saved_at"]
 SHEET_TITLES = ["設定", "当日シグナル", "日次サマリー", "売買記録台帳", "システム"]
 
+NUMERIC_COLS_BY_SHEET = {
+    "当日シグナル": [
+        "PCA主成分数", "有効学習件数", "1位スコア", "1位-4位差", "スコア",
+        "順位", "最終順位", "推奨予算", "推定価格", "1口金額", "推奨口数",
+        "推奨約定金額", "前日出来高",
+    ],
+    "日次サマリー": [
+        "PCA主成分数", "1位スコア", "1位-4位差", "フィルタ通過本数", "最終採用本数",
+    ],
+    "売買記録台帳": [
+        "予定順位", "予定スコア", "予定予算", "1口金額", "予定口数", "予定約定金額",
+        "買値", "売値", "口数", "損益額", "損益率",
+    ],
+}
+YEN_COLS = {"推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"}
+PERCENT_COLS = {"損益率"}
+LIGHT_BLUE = {"red": 0.918, "green": 0.953, "blue": 1.0}
+WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
 
 def now_jst() -> datetime:
     return datetime.now(JST)
@@ -579,14 +599,91 @@ def read_ws_df(title: str) -> pd.DataFrame:
     return pd.DataFrame(clean_rows, columns=headers)
 
 
+def normalize_df_for_sheet(title: str, df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in NUMERIC_COLS_BY_SHEET.get(title, []):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _make_repeat_cell_request(sheet_id: int, start_row: int, end_row: int, start_col: int, end_col: int, cell_format: dict, fields: str) -> dict:
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row,
+                "endRowIndex": end_row,
+                "startColumnIndex": start_col,
+                "endColumnIndex": end_col,
+            },
+            "cell": {"userEnteredFormat": cell_format},
+            "fields": fields,
+        }
+    }
+
+
+def apply_ws_formatting(title: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    ws = get_or_create_ws(open_workbook(), title)
+    requests = []
+    row_count = len(df)
+    headers = list(df.columns)
+    header_to_idx = {h: i for i, h in enumerate(headers)}
+
+    for col in headers:
+        if col in YEN_COLS:
+            requests.append(
+                _make_repeat_cell_request(
+                    ws.id, 1, row_count + 1, header_to_idx[col], header_to_idx[col] + 1,
+                    {"numberFormat": {"type": "CURRENCY", "pattern": "¥#,##0"}},
+                    "userEnteredFormat.numberFormat",
+                )
+            )
+        elif col in PERCENT_COLS:
+            requests.append(
+                _make_repeat_cell_request(
+                    ws.id, 1, row_count + 1, header_to_idx[col], header_to_idx[col] + 1,
+                    {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}},
+                    "userEnteredFormat.numberFormat",
+                )
+            )
+
+    if title == "売買記録台帳" and "売買日" in df.columns:
+        dates = pd.to_datetime(df["売買日"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+        group_start = 0
+        alt = False
+        prev = dates.iloc[0] if len(dates) else None
+        for i in range(1, len(dates) + 1):
+            current = dates.iloc[i] if i < len(dates) else None
+            if i == len(dates) or current != prev:
+                color = LIGHT_BLUE if alt else WHITE
+                requests.append(
+                    _make_repeat_cell_request(
+                        ws.id, group_start + 1, i + 1, 0, len(headers),
+                        {"backgroundColor": color},
+                        "userEnteredFormat.backgroundColor",
+                    )
+                )
+                group_start = i
+                prev = current
+                alt = not alt
+
+    if requests:
+        ws.spreadsheet.batch_update({"requests": requests})
+
+
 def write_ws_df(title: str, df: pd.DataFrame):
     ws = get_or_create_ws(open_workbook(), title)
     ws.clear()
     if df is None or df.empty:
         return
-    clean = df.fillna("").astype(str)
+    clean = normalize_df_for_sheet(title, df)
+    clean = clean.where(pd.notna(clean), "")
     data = [clean.columns.tolist()] + clean.values.tolist()
-    ws.update(data)
+    ws.update(data, value_input_option="USER_ENTERED")
+    apply_ws_formatting(title, clean)
 
 
 def append_or_replace_rows(title: str, new_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
