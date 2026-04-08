@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit Community Cloud 版
-日米時差ETF戦略 試験運用アプリ 初版
+日米時差ETF戦略 試験運用アプリ
 
-- 永続保存なし
 - シグナル計算
 - 日次サマリー表示
 - 候補一覧表示
 - 売買記録入力
 - CSV / Excel ダウンロード
+- 台帳CSV / Excel をアップロードして追記・再ダウンロード
 """
 
 from __future__ import annotations
@@ -29,9 +29,6 @@ st.set_page_config(
 )
 
 
-# -----------------------------
-# 既存ローカル版の設定を初期値として反映
-# -----------------------------
 US_ETFS = {
     "XLB": "Materials",
     "XLE": "Energy",
@@ -86,9 +83,15 @@ DEFAULTS = {
     "min_suggested_qty": 1,
 }
 
+TRADE_COLS = [
+    "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算", "1口金額",
+    "予定口数", "予定約定金額", "注意フラグ", "実行有無", "買値", "売値", "口数",
+    "損益額", "損益率", "入力チェック", "メモ",
+]
+
 
 # -----------------------------
-# 計算ロジック（ローカル版から移植）
+# 計算ロジック
 # -----------------------------
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -202,9 +205,7 @@ def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings:
     top_n = settings["top_n"]
 
     if len(aligned_us) < min_history or len(aligned_jp) < min_history:
-        raise ValueError(
-            f"履歴不足です。aligned_us={len(aligned_us)}, aligned_jp={len(aligned_jp)}"
-        )
+        raise ValueError(f"履歴不足です。aligned_us={len(aligned_us)}, aligned_jp={len(aligned_jp)}")
 
     use_us = aligned_us.iloc[-rolling_window:].copy()
     use_jp = aligned_jp.iloc[-rolling_window:].copy()
@@ -258,10 +259,7 @@ def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings:
         except Exception:
             scores[jp_code] = 0.0
 
-    score_df = pd.DataFrame({
-        "jp_code": list(scores.keys()),
-        "score": list(scores.values()),
-    })
+    score_df = pd.DataFrame({"jp_code": list(scores.keys()), "score": list(scores.values())})
     score_df["valid_train_count"] = score_df["jp_code"].map(valid_counts)
     score_df["score"] = pd.to_numeric(score_df["score"], errors="coerce").fillna(0.0)
     score_df["jp_name"] = score_df["jp_code"].map(JP_ETFS)
@@ -495,11 +493,7 @@ def build_daily_summary_df(signal_df: pd.DataFrame) -> pd.DataFrame:
 def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
     selected_df = signal_df[signal_df["採用"] == True].copy()
     if selected_df.empty:
-        return pd.DataFrame(columns=[
-            "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算", "1口金額",
-            "予定口数", "予定約定金額", "注意フラグ", "実行有無", "買値", "売値", "口数",
-            "損益額", "損益率", "入力チェック", "メモ",
-        ])
+        return pd.DataFrame(columns=TRADE_COLS)
 
     trade_df = pd.DataFrame({
         "売買日": selected_df["シグナル日付"],
@@ -527,10 +521,11 @@ def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
 def recalc_trade_input_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
-        return out
+        return ensure_trade_columns(out)
 
     for col in ["買値", "売値", "口数"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     pnl = []
     pnl_pct = []
@@ -560,27 +555,84 @@ def recalc_trade_input_df(df: pd.DataFrame) -> pd.DataFrame:
     out["損益額"] = pnl
     out["損益率"] = pnl_pct
     out["入力チェック"] = checks
-    return out
+    return ensure_trade_columns(out)
+
+
+def ensure_trade_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in TRADE_COLS:
+        if col not in out.columns:
+            out[col] = np.nan if col in ["予定順位", "予定スコア", "予定予算", "1口金額", "予定口数", "予定約定金額", "買値", "売値", "口数", "損益額", "損益率"] else ""
+    return out[TRADE_COLS]
 
 
 def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     num4_cols = ["スコア", "予定スコア", "1位スコア", "1位-4位差"]
-    yen_cols = ["推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"]
     int_cols = ["順位", "最終順位", "推奨口数", "前日出来高", "予定順位", "予定口数", "口数", "有効学習件数", "フィルタ通過本数", "最終採用本数"]
 
     for col in num4_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(4)
-    for col in yen_cols:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(0)
     for col in int_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    yen_cols = ["推奨予算", "推定価格", "1口金額", "推奨約定金額", "予定予算", "予定約定金額", "買値", "売値", "損益額"]
+    for col in yen_cols:
+        if col in out.columns:
+            vals = pd.to_numeric(out[col], errors="coerce")
+            out[col] = vals.apply(lambda x: "" if pd.isna(x) else f"¥{x:,.0f}")
+
     if "損益率" in out.columns:
-        out["損益率(%)"] = pd.to_numeric(out["損益率"], errors="coerce") * 100
+        vals = pd.to_numeric(out["損益率"], errors="coerce")
+        out["損益率"] = vals.apply(lambda x: "" if pd.isna(x) else f"{x * 100:.3f}%")
+
     return out
+
+
+def ledger_key_columns(df: pd.DataFrame) -> pd.Series:
+    work = df.copy()
+    sell_date = pd.to_datetime(work.get("売買日"), errors="coerce").dt.strftime("%Y-%m-%d")
+    code = work.get("日本ETFコード", "").fillna("").astype(str)
+    return sell_date.fillna("") + "|" + code
+
+
+def merge_trade_ledger(base_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    base = recalc_trade_input_df(ensure_trade_columns(base_df))
+    new = recalc_trade_input_df(ensure_trade_columns(new_df))
+
+    if base.empty:
+        merged = new.copy()
+    else:
+        base["_ledger_key"] = ledger_key_columns(base)
+        new["_ledger_key"] = ledger_key_columns(new)
+        merged = pd.concat([base, new], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["_ledger_key"], keep="last")
+        merged = merged.drop(columns=["_ledger_key"], errors="ignore")
+
+    if "売買日" in merged.columns:
+        merged["_sort_date"] = pd.to_datetime(merged["売買日"], errors="coerce")
+        merged = merged.sort_values(["_sort_date", "予定順位", "日本ETFコード"], ascending=[True, True, True], na_position="last")
+        merged = merged.drop(columns=["_sort_date"], errors="ignore")
+
+    return recalc_trade_input_df(ensure_trade_columns(merged)).reset_index(drop=True)
+
+
+def load_trade_ledger(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        xls = pd.ExcelFile(uploaded_file)
+        if "売買記録" in xls.sheet_names:
+            df = pd.read_excel(uploaded_file, sheet_name="売買記録")
+        else:
+            df = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("CSV または Excel(.xlsx) をアップロードしてください。")
+
+    return recalc_trade_input_df(ensure_trade_columns(df))
 
 
 def make_excel_download(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame) -> bytes:
@@ -593,6 +645,14 @@ def make_excel_download(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_d
     return output.getvalue()
 
 
+def make_ledger_excel_download(ledger_df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        ledger_df.to_excel(writer, sheet_name="売買記録", index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
 def make_csv_download(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
@@ -601,7 +661,7 @@ def make_csv_download(df: pd.DataFrame) -> bytes:
 # UI
 # -----------------------------
 st.title("日米時差ETF戦略 / Streamlit試験版")
-st.caption("PCA回帰ベース・永続保存なし・Androidタブレットのブラウザ利用を想定")
+st.caption("PCA回帰ベース・Androidタブレットのブラウザ利用を想定")
 
 with st.sidebar:
     st.subheader("設定")
@@ -635,8 +695,8 @@ if "daily_df" not in st.session_state:
     st.session_state.daily_df = pd.DataFrame()
 if "trade_df" not in st.session_state:
     st.session_state.trade_df = pd.DataFrame()
-if "latest_close_df" not in st.session_state:
-    st.session_state.latest_close_df = pd.DataFrame()
+if "ledger_df" not in st.session_state:
+    st.session_state.ledger_df = pd.DataFrame(columns=TRADE_COLS)
 
 if run_button:
     try:
@@ -660,17 +720,17 @@ if run_button:
         st.session_state.signal_df = signal_df
         st.session_state.daily_df = daily_df
         st.session_state.trade_df = trade_df
-        st.session_state.latest_close_df = close_df.tail(5)
         st.success("計算が完了しました。")
     except Exception as e:
         st.error(f"エラー: {e}")
 
 signal_df = st.session_state.signal_df
-Daily_df = st.session_state.daily_df
+daily_df = st.session_state.daily_df
 trade_df_state = st.session_state.trade_df
+ledger_df_state = st.session_state.ledger_df
 
 if not signal_df.empty:
-    summary_row = Daily_df.iloc[0]
+    summary_row = daily_df.iloc[0]
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("シグナル日付", str(summary_row["シグナル日付"]))
     col2.metric("フィルタ通過本数", int(summary_row["フィルタ通過本数"]))
@@ -680,10 +740,10 @@ if not signal_df.empty:
     if bool(summary_row["見送り候補"]):
         st.warning(f"見送り候補です。理由: {summary_row['見送り理由']}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["日次サマリー", "候補一覧", "売買記録入力", "ダウンロード"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["日次サマリー", "候補一覧", "売買記録入力", "台帳へ蓄積", "ダウンロード"])
 
     with tab1:
-        st.dataframe(format_display_df(Daily_df), use_container_width=True, hide_index=True)
+        st.dataframe(format_display_df(daily_df), use_container_width=True, hide_index=True)
 
     with tab2:
         view_cols = [
@@ -696,59 +756,99 @@ if not signal_df.empty:
 
     with tab3:
         st.write("採用銘柄だけ編集できます。実行有無は 〇 / × / 空欄 を想定しています。")
-        st.caption("入力途中の再描画を減らすため、下の『入力内容を反映』を押した時点で損益額・損益率・入力チェックを更新します。")
 
-        if trade_df_state.empty:
-            st.info("採用銘柄がないため、売買記録の入力対象がありません。")
-        else:
-            with st.form("trade_input_form"):
-                edited_df = st.data_editor(
-                    trade_df_state.copy(),
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=[
-                        "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
-                        "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
-                    ],
-                    column_config={
-                        "売買日": st.column_config.TextColumn("売買日", width="small"),
-                        "日本ETFコード": st.column_config.TextColumn("日本ETFコード", width="small"),
-                        "日本ETF名": st.column_config.TextColumn("日本ETF名", width="medium"),
-                        "予定順位": st.column_config.NumberColumn("予定順位", format="%d", width="small"),
-                        "予定スコア": st.column_config.NumberColumn("予定スコア", format="%.4f"),
-                        "予定予算": st.column_config.NumberColumn("予定予算", format="¥ %.0f"),
-                        "1口金額": st.column_config.NumberColumn("1口金額", format="¥ %.0f"),
-                        "予定口数": st.column_config.NumberColumn("予定口数", format="%d"),
-                        "予定約定金額": st.column_config.NumberColumn("予定約定金額", format="¥ %.0f"),
-                        "実行有無": st.column_config.SelectboxColumn(
-                            "実行有無",
-                            options=["", "〇", "×"],
-                            required=False,
-                            width="small",
-                        ),
-                        "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0, format="¥ %.0f"),
-                        "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0, format="¥ %.0f"),
-                        "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0, format="%.0f"),
-                        "損益額": st.column_config.NumberColumn("損益額", format="¥ %.0f"),
-                        "損益率": st.column_config.NumberColumn("損益率", format="%.3f%%"),
-                        "入力チェック": st.column_config.TextColumn("入力チェック", width="small"),
-                        "メモ": st.column_config.TextColumn("メモ", width="medium"),
-                    },
-                    key="trade_editor",
-                )
-                apply_trade_edits = st.form_submit_button("入力内容を反映", type="primary", use_container_width=True)
+        edited_df = st.data_editor(
+            trade_df_state.copy(),
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "売買日", "日本ETFコード", "日本ETF名", "予定順位", "予定スコア", "予定予算",
+                "1口金額", "予定口数", "予定約定金額", "注意フラグ", "損益額", "損益率", "入力チェック",
+            ],
+            column_config={
+                "実行有無": st.column_config.SelectboxColumn("実行有無", options=["", "〇", "×"], required=False),
+                "買値": st.column_config.NumberColumn("買値", min_value=0.0, step=1.0, format="¥%.0f"),
+                "売値": st.column_config.NumberColumn("売値", min_value=0.0, step=1.0, format="¥%.0f"),
+                "口数": st.column_config.NumberColumn("口数", min_value=0.0, step=1.0, format="%.0f"),
+                "損益額": st.column_config.NumberColumn("損益額", format="¥%.0f"),
+                "損益率": st.column_config.NumberColumn("損益率", format="%.4f"),
+            },
+            key="trade_editor",
+        )
 
-            if apply_trade_edits:
-                st.session_state.trade_df = recalc_trade_input_df(edited_df)
-                st.success("売買記録を更新しました。")
-                st.rerun()
+        if st.button("入力内容を反映", key="apply_trade_input", use_container_width=True):
+            st.session_state.trade_df = recalc_trade_input_df(edited_df)
+            st.success("売買記録へ反映しました。")
+
+        st.dataframe(format_display_df(st.session_state.trade_df), use_container_width=True, hide_index=True)
 
     with tab4:
-        excel_bytes = make_excel_download(signal_df, Daily_df, st.session_state.trade_df)
+        st.write("既存の台帳CSV / Excel を読み込み、今回の売買記録を追記して再ダウンロードできます。")
+        uploaded_ledger = st.file_uploader(
+            "台帳ファイルをアップロード",
+            type=["csv", "xlsx", "xls"],
+            help="CSV は売買記録CSV、Excel は売買記録シートを含むファイルを想定しています。",
+            key="ledger_uploader",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("アップロードした台帳を読み込む", use_container_width=True):
+                try:
+                    if uploaded_ledger is None:
+                        st.warning("先に台帳ファイルを選択してください。")
+                    else:
+                        st.session_state.ledger_df = load_trade_ledger(uploaded_ledger)
+                        st.success("台帳を読み込みました。")
+                except Exception as e:
+                    st.error(f"台帳読込エラー: {e}")
+        with c2:
+            if st.button("現在の入力を台帳へ追記 / 上書き反映", use_container_width=True):
+                st.session_state.ledger_df = merge_trade_ledger(st.session_state.ledger_df, st.session_state.trade_df)
+                st.success("台帳へ現在分を反映しました。同じ売買日+ETFコードは最新内容で上書きしています。")
+
+        ledger_df_state = st.session_state.ledger_df
+
+        if not ledger_df_state.empty:
+            ledger_exec = int((ledger_df_state["実行有無"] == "〇").sum()) if "実行有無" in ledger_df_state.columns else 0
+            ledger_total = int(len(ledger_df_state))
+            ledger_dates = pd.to_datetime(ledger_df_state["売買日"], errors="coerce") if "売買日" in ledger_df_state.columns else pd.Series(dtype="datetime64[ns]")
+            d1, d2, d3 = st.columns(3)
+            d1.metric("台帳件数", ledger_total)
+            d2.metric("実行〇件数", ledger_exec)
+            d3.metric("台帳最終日", "" if ledger_dates.dropna().empty else ledger_dates.max().strftime("%Y-%m-%d"))
+
+            st.dataframe(format_display_df(ledger_df_state), use_container_width=True, hide_index=True)
+
+            merged_csv = make_csv_download(ledger_df_state)
+            merged_xlsx = make_ledger_excel_download(ledger_df_state)
+            today_text = datetime.now().strftime("%Y%m%d")
+            b1, b2 = st.columns(2)
+            with b1:
+                st.download_button(
+                    "蓄積台帳CSVをダウンロード",
+                    data=merged_csv,
+                    file_name=f"trade_ledger_{today_text}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with b2:
+                st.download_button(
+                    "蓄積台帳Excelをダウンロード",
+                    data=merged_xlsx,
+                    file_name=f"trade_ledger_{today_text}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+        else:
+            st.info("まだ台帳は空です。まず現在の入力を反映するか、過去の台帳をアップロードしてください。")
+
+    with tab5:
+        excel_bytes = make_excel_download(signal_df, daily_df, st.session_state.trade_df)
         signal_csv = make_csv_download(signal_df)
-        daily_csv = make_csv_download(Daily_df)
+        daily_csv = make_csv_download(daily_df)
         trade_csv = make_csv_download(st.session_state.trade_df)
-        signal_date = str(Daily_df.iloc[0]["シグナル日付"])
+        signal_date = str(daily_df.iloc[0]["シグナル日付"])
 
         c1, c2 = st.columns(2)
         with c1:
@@ -787,9 +887,9 @@ else:
 with st.expander("この試験版の位置づけ"):
     st.markdown(
         """
-- この初版は **永続保存なし** です。
-- 毎回その場でデータ取得・計算を行い、結果を画面表示します。
-- 売買記録は画面上で入力できますが、Community Cloud 側には保存されません。
-- 必要なときに Excel / CSV をダウンロードして、ローカル台帳へ取り込む前提です。
+- この版は Community Cloud 上へ自動永続保存する方式ではありません。
+- その代わり、**既存台帳をアップロード → 今回分を追記 → 蓄積台帳を再ダウンロード** できます。
+- 同じ **売買日 + 日本ETFコード** は、台帳へ再反映したとき最新内容で上書きします。
+- まずは CSV 台帳で試すのが簡単です。必要なら Excel 台帳でも運用できます。
         """
     )
