@@ -72,6 +72,20 @@ def read_ws_df(title: str) -> pd.DataFrame:
 # -----------------------------
 # Preprocess
 # -----------------------------
+
+
+def normalize_date_like(val) -> str:
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if s == "" or s.lower() == "none":
+        return ""
+    s = s.replace("/", "-").replace(".", "-")
+    ts = pd.to_datetime(s, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return pd.Timestamp(ts).strftime("%Y-%m-%d")
+
 def normalize_exec_flag(val) -> str:
     s = str(val).strip()
     mapping = {
@@ -133,7 +147,8 @@ def preprocess_trade_log(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = clean_numeric_series(df[col])
 
     # 日付
-    df["売買日"] = pd.to_datetime(df["売買日"], errors="coerce")
+    df["売買日_key"] = df["売買日"].apply(normalize_date_like)
+    df["売買日"] = pd.to_datetime(df["売買日_key"], errors="coerce")
 
     # 集計対象: 実行有無が〇 かつ 買値・売値・口数が揃っている
     df = df[df["実行有無"] == "〇"].copy()
@@ -165,7 +180,8 @@ def preprocess_daily_signal_log(df: pd.DataFrame) -> pd.DataFrame:
     if "シグナル日付" not in df.columns:
         df["シグナル日付"] = ""
 
-    df["シグナル日付"] = pd.to_datetime(df["シグナル日付"], errors="coerce")
+    df["シグナル日付_key"] = df["シグナル日付"].apply(normalize_date_like)
+    df["シグナル日付"] = pd.to_datetime(df["シグナル日付_key"], errors="coerce")
     df = df.dropna(subset=["シグナル日付"]).copy()
 
     if df.empty:
