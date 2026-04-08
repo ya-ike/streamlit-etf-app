@@ -757,8 +757,10 @@ if not signal_df.empty:
     with tab3:
         st.write("採用銘柄だけ編集できます。実行有無は 〇 / × / 空欄 を想定しています。")
 
+        base_trade_df = recalc_trade_input_df(trade_df_state.copy())
+
         edited_df = st.data_editor(
-            trade_df_state.copy(),
+            base_trade_df,
             use_container_width=True,
             hide_index=True,
             disabled=[
@@ -778,9 +780,7 @@ if not signal_df.empty:
 
         if st.button("入力内容を反映", key="apply_trade_input", use_container_width=True):
             st.session_state.trade_df = recalc_trade_input_df(edited_df)
-            st.success("売買記録へ反映しました。")
-
-        st.dataframe(format_display_df(st.session_state.trade_df), use_container_width=True, hide_index=True)
+            st.rerun()
 
     with tab4:
         st.write("既存の台帳CSV / Excel を読み込み、今回の売買記録を追記して再ダウンロードできます。")
