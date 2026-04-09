@@ -1,14 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit Community Cloud 版
+app.py
 日米時差ETF戦略 / Google Sheets 保存版
-
-仕様:
-- Google Sheets を保存先に使用
-- 朝の確定計算は 1 回だけ
-- 確定後は翌日 06:00(JST) まで再計算しない
-- 夕方は保存済み候補を使って売買記録だけ更新
-- 売買記録台帳は 売買日 + 日本ETFコード で上書き保存
+設定シート・システムシート対応
 """
 
 from __future__ import annotations
@@ -62,22 +56,28 @@ JP_ETFS = {
 }
 ALL_TICKERS = list(US_ETFS.keys()) + list(JP_ETFS.keys())
 
-DEFAULTS = {
-    "total_budget": 600000,
-    "top_n": 3,
-    "rolling_window": 60,
-    "min_history": 40,
-    "min_price_buffer": 1.02,
-    "min_avg_volume": 1000,
-    "use_volume_filter": False,
-    "low_price_threshold": 1000,
-    "high_qty_threshold": 100,
-    "pca_components": 3,
-    "ridge_alpha": 1e-6,
-    "skip_if_top1_leq_zero": True,
-    "min_score_spread": 0.0010,
-    "require_positive_score": True,
-    "min_suggested_qty": 1,
+DEFAULT_SETTINGS_JP = {
+    "モード": "実運用",
+    "総投資額": "600000",
+    "最大採用本数": "3",
+    "ローリング窓": "60",
+    "最低必要履歴数": "40",
+    "PCA主成分数": "3",
+    "リッジ係数": "0.000001",
+    "MIN_SCORE_SPREAD": "0.0010",
+    "1位スコア<=0で見送り候補": "TRUE",
+    "スコア>0のみ採用": "TRUE",
+    "出来高フィルタを使う": "FALSE",
+    "最小推奨口数": "1",
+    "数量計算安全係数": "1.02",
+    "最低平均出来高": "1000",
+    "低単価しきい値": "1000",
+    "口数多めしきい値": "100",
+}
+DEFAULT_SYSTEM_JP = {
+    "last_signal_date": "",
+    "lock_until": "",
+    "last_saved_at": "",
 }
 
 TRADE_COLS = [
@@ -85,7 +85,6 @@ TRADE_COLS = [
     "予定口数", "予定約定金額", "注意フラグ", "実行有無", "買値", "売値", "口数",
     "損益額", "損益率", "入力チェック", "メモ",
 ]
-SYSTEM_KEYS = ["last_signal_date", "lock_until", "last_saved_at"]
 SHEET_TITLES = ["設定", "当日シグナル", "日次サマリー", "売買記録台帳", "システム"]
 
 
@@ -103,37 +102,205 @@ def to_date_str(ts) -> str:
     return pd.Timestamp(ts).strftime("%Y-%m-%d")
 
 
+def parse_bool_jp(val, default=False) -> bool:
+    s = str(val).strip().lower()
+    if s in ["true", "1", "yes", "y", "on", "はい"]:
+        return True
+    if s in ["false", "0", "no", "n", "off", "いいえ"]:
+        return False
+    return default
 
 
-def normalize_date_like(val) -> str:
-    """
-    日付文字列を集計・キー用に正規化する。
-    例:
-    - 2026-04-08
-    - 2026/04/08
-    - 2026-04-08 16:23:35
-    - 2026/04/08 16:23:35
-    をすべて YYYY-MM-DD にそろえる
-    """
-    if pd.isna(val):
-        return ""
+def normalize_date_like_text(val) -> str:
     s = str(val).strip()
-    if s == "" or s.lower() == "none":
+    if s == "" or s.lower() in ["none", "nan", "nat"]:
         return ""
-    s = s.replace("/", "-").replace(".", "-")
-    ts = pd.to_datetime(s, errors="coerce")
-    if pd.isna(ts):
-        return ""
-    return pd.Timestamp(ts).strftime("%Y-%m-%d")
+    s = s.replace("/", "-")
+    try:
+        dt = pd.to_datetime(s, errors="coerce")
+        if pd.isna(dt):
+            return s
+        return pd.Timestamp(dt).strftime("%Y-%m-%d")
+    except Exception:
+        return s
 
-def parse_dt_or_none(text: str | None) -> datetime | None:
+
+def parse_dt_or_none(text: str | None):
     if not text:
         return None
+    t = str(text).strip().replace("/", "-")
     try:
-        dt = datetime.fromisoformat(str(text))
+        dt = datetime.fromisoformat(t)
         return dt.replace(tzinfo=JST) if dt.tzinfo is None else dt.astimezone(JST)
     except Exception:
-        return None
+        try:
+            dt = pd.to_datetime(t, errors="coerce")
+            if pd.isna(dt):
+                return None
+            dt = pd.Timestamp(dt).to_pydatetime()
+            return dt.replace(tzinfo=JST) if dt.tzinfo is None else dt.astimezone(JST)
+        except Exception:
+            return None
+
+
+def clean_numeric_series(series: pd.Series) -> pd.Series:
+    s = series.astype(str)
+    s = (
+        s.str.replace("¥", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.strip()
+    )
+    s = s.replace({"": np.nan, "None": np.nan, "nan": np.nan, "NaN": np.nan})
+    return pd.to_numeric(s, errors="coerce")
+
+
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Secrets に [gcp_service_account] がありません。")
+    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+
+
+@st.cache_resource(show_spinner=False)
+def open_workbook():
+    client = get_gspread_client()
+    sheet_name = st.secrets.get("sheets", {}).get("spreadsheet_name", "ETF_運用台帳")
+    return client.open(sheet_name)
+
+
+def get_or_create_ws(book, title: str):
+    try:
+        return book.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return book.add_worksheet(title=title, rows=300, cols=60)
+
+
+def read_ws_df(title: str) -> pd.DataFrame:
+    ws = get_or_create_ws(open_workbook(), title)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    headers = values[0]
+    rows = values[1:]
+    if not headers:
+        return pd.DataFrame()
+
+    clean_rows = []
+    for r in rows:
+        padded = r + [""] * max(0, len(headers) - len(r))
+        if any(str(x).strip() != "" for x in padded):
+            clean_rows.append(padded[:len(headers)])
+
+    if not clean_rows:
+        return pd.DataFrame(columns=headers)
+    return pd.DataFrame(clean_rows, columns=headers)
+
+
+def write_ws_df(title: str, df: pd.DataFrame):
+    ws = get_or_create_ws(open_workbook(), title)
+    ws.clear()
+    if df is None or df.empty:
+        return
+    clean = df.copy().fillna("")
+    data = [clean.columns.tolist()] + clean.values.tolist()
+    ws.update(data)
+
+
+def ensure_base_sheets_and_defaults():
+    book = open_workbook()
+    for title in SHEET_TITLES:
+        get_or_create_ws(book, title)
+
+    settings_df = read_ws_df("設定")
+    if settings_df.empty or "項目" not in settings_df.columns or "値" not in settings_df.columns:
+        df = pd.DataFrame({"項目": list(DEFAULT_SETTINGS_JP.keys()), "値": list(DEFAULT_SETTINGS_JP.values())})
+        write_ws_df("設定", df)
+    else:
+        current = {str(r["項目"]).strip(): str(r["値"]).strip() for _, r in settings_df.iterrows()}
+        changed = False
+        for k, v in DEFAULT_SETTINGS_JP.items():
+            if k not in current:
+                current[k] = v
+                changed = True
+        if changed:
+            df = pd.DataFrame({"項目": list(current.keys()), "値": list(current.values())})
+            write_ws_df("設定", df)
+
+    system_df = read_ws_df("システム")
+    if system_df.empty or "key" not in system_df.columns or "value" not in system_df.columns:
+        df = pd.DataFrame({"key": list(DEFAULT_SYSTEM_JP.keys()), "value": list(DEFAULT_SYSTEM_JP.values())})
+        write_ws_df("システム", df)
+    else:
+        current = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in system_df.iterrows()}
+        changed = False
+        for k, v in DEFAULT_SYSTEM_JP.items():
+            if k not in current:
+                current[k] = v
+                changed = True
+        if changed:
+            df = pd.DataFrame({"key": list(current.keys()), "value": list(current.values())})
+            write_ws_df("システム", df)
+
+
+def load_settings_map() -> dict:
+    ensure_base_sheets_and_defaults()
+    df = read_ws_df("設定")
+    if df.empty:
+        return DEFAULT_SETTINGS_JP.copy()
+    out = {str(r["項目"]).strip(): str(r["値"]).strip() for _, r in df.iterrows()}
+    for k, v in DEFAULT_SETTINGS_JP.items():
+        out.setdefault(k, v)
+    return out
+
+
+def save_settings_map(settings_map: dict):
+    df = pd.DataFrame({"項目": list(settings_map.keys()), "値": [settings_map[k] for k in settings_map.keys()]})
+    write_ws_df("設定", df)
+
+
+def load_system_map() -> dict:
+    ensure_base_sheets_and_defaults()
+    df = read_ws_df("システム")
+    if df.empty:
+        return DEFAULT_SYSTEM_JP.copy()
+    out = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in df.iterrows()}
+    for k, v in DEFAULT_SYSTEM_JP.items():
+        out.setdefault(k, v)
+    return out
+
+
+def save_system_map(sys_map: dict):
+    df = pd.DataFrame({"key": list(sys_map.keys()), "value": [sys_map[k] for k in sys_map.keys()]})
+    write_ws_df("システム", df)
+
+
+def jp_settings_to_internal(settings_map: dict) -> dict:
+    mode = settings_map.get("モード", "実運用").strip() or "実運用"
+    internal = {
+        "mode": mode,
+        "total_budget": int(float(settings_map.get("総投資額", DEFAULT_SETTINGS_JP["総投資額"]))),
+        "top_n": int(float(settings_map.get("最大採用本数", DEFAULT_SETTINGS_JP["最大採用本数"]))),
+        "rolling_window": int(float(settings_map.get("ローリング窓", DEFAULT_SETTINGS_JP["ローリング窓"]))),
+        "min_history": int(float(settings_map.get("最低必要履歴数", DEFAULT_SETTINGS_JP["最低必要履歴数"]))),
+        "pca_components": int(float(settings_map.get("PCA主成分数", DEFAULT_SETTINGS_JP["PCA主成分数"]))),
+        "ridge_alpha": float(settings_map.get("リッジ係数", DEFAULT_SETTINGS_JP["リッジ係数"])),
+        "min_score_spread": float(settings_map.get("MIN_SCORE_SPREAD", DEFAULT_SETTINGS_JP["MIN_SCORE_SPREAD"])),
+        "skip_if_top1_leq_zero": parse_bool_jp(settings_map.get("1位スコア<=0で見送り候補", DEFAULT_SETTINGS_JP["1位スコア<=0で見送り候補"]), True),
+        "require_positive_score": parse_bool_jp(settings_map.get("スコア>0のみ採用", DEFAULT_SETTINGS_JP["スコア>0のみ採用"]), True),
+        "use_volume_filter": parse_bool_jp(settings_map.get("出来高フィルタを使う", DEFAULT_SETTINGS_JP["出来高フィルタを使う"]), False),
+        "min_suggested_qty": int(float(settings_map.get("最小推奨口数", DEFAULT_SETTINGS_JP["最小推奨口数"]))),
+        "min_price_buffer": float(settings_map.get("数量計算安全係数", DEFAULT_SETTINGS_JP["数量計算安全係数"])),
+        "min_avg_volume": int(float(settings_map.get("最低平均出来高", DEFAULT_SETTINGS_JP["最低平均出来高"]))),
+        "low_price_threshold": float(settings_map.get("低単価しきい値", DEFAULT_SETTINGS_JP["低単価しきい値"])),
+        "high_qty_threshold": float(settings_map.get("口数多めしきい値", DEFAULT_SETTINGS_JP["口数多めしきい値"])),
+    }
+    if mode == "論文寄り":
+        internal["use_volume_filter"] = False
+        internal["require_positive_score"] = False
+        internal["skip_if_top1_leq_zero"] = False
+        internal["min_score_spread"] = 0.0
+    return internal
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -147,11 +314,9 @@ def download_price_data(period: str = "2y"):
         progress=False,
         threads=True,
     )
-
     close_df = pd.DataFrame()
     open_df = pd.DataFrame()
     volume_df = pd.DataFrame()
-
     if isinstance(data.columns, pd.MultiIndex):
         for ticker in ALL_TICKERS:
             if ticker not in data.columns.get_level_values(0):
@@ -171,7 +336,6 @@ def download_price_data(period: str = "2y"):
             open_df[t0] = data["Open"]
         if "Volume" in data.columns:
             volume_df[t0] = data["Volume"]
-
     return close_df.sort_index(), open_df.sort_index(), volume_df.sort_index()
 
 
@@ -203,7 +367,6 @@ def align_us_to_jp(us_ret: pd.DataFrame, jp_ret: pd.DataFrame):
             continue
         aligned_rows.append(us_ret.loc[us_date].values)
         aligned_index.append(jp_date)
-
     aligned_us = pd.DataFrame(aligned_rows, index=pd.DatetimeIndex(aligned_index), columns=us_ret.columns)
     common_index = aligned_us.index.intersection(jp_ret.index)
     return aligned_us.loc[common_index].sort_index(), jp_ret.loc[common_index].sort_index()
@@ -218,18 +381,14 @@ def get_latest_mapping_info(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame):
 def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings: dict) -> pd.DataFrame:
     if len(aligned_us) < settings["min_history"] or len(aligned_jp) < settings["min_history"]:
         raise ValueError(f"履歴不足です。aligned_us={len(aligned_us)}, aligned_jp={len(aligned_jp)}")
-
     use_us = aligned_us.iloc[-settings["rolling_window"]:].copy()
     use_jp = aligned_jp.iloc[-settings["rolling_window"]:].copy()
-
     us_mean = use_us.mean(axis=0)
     us_std = use_us.std(axis=0, ddof=0).replace(0, np.nan)
     us_z = ((use_us - us_mean) / us_std).fillna(0.0)
-
     x_full = us_z.copy()
     t_full, n_assets = x_full.shape
     k = min(settings["pca_components"], n_assets, t_full)
-
     cov = np.cov(x_full.values, rowvar=False)
     eigvals, eigvecs = np.linalg.eigh(cov)
     order = np.argsort(eigvals)[::-1]
@@ -237,7 +396,6 @@ def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings:
     v = eigvecs[:, :k]
     f_full = x_full.values @ v
     latest_factor = x_full.iloc[-1].values.reshape(1, -1) @ v
-
     scores = {}
     valid_counts = {}
     for jp_code in use_jp.columns:
@@ -260,7 +418,6 @@ def compute_scores(aligned_us: pd.DataFrame, aligned_jp: pd.DataFrame, settings:
             scores[jp_code] = 0.0 if np.isnan(pred) or np.isinf(pred) else pred
         except Exception:
             scores[jp_code] = 0.0
-
     score_df = pd.DataFrame({"jp_code": list(scores.keys()), "score": list(scores.values())})
     score_df["valid_train_count"] = score_df["jp_code"].map(valid_counts)
     score_df["jp_name"] = score_df["jp_code"].map(JP_ETFS)
@@ -278,7 +435,6 @@ def add_skip_flags(score_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
         out["top1_score"] = np.nan
         out["spread_1_4"] = np.nan
         return out
-
     top1_score = float(out.iloc[0]["score"])
     top4_score = float(out.iloc[3]["score"]) if len(out) >= 4 else float(out.iloc[-1]["score"])
     spread_1_4 = top1_score - top4_score
@@ -313,7 +469,6 @@ def apply_quality_filters(score_df: pd.DataFrame, settings: dict) -> pd.DataFram
             reason_list.append("低出来高")
         pass_flags.append(len(reason_list) == 0)
         reasons.append("|".join(reason_list))
-
     out["フィルタ通過"] = pass_flags
     out["除外理由"] = reasons
     out["selected"] = False
@@ -332,10 +487,8 @@ def calculate_suggested_quantity(score_df: pd.DataFrame, close_df: pd.DataFrame,
     latest_close = jp_close.ffill().iloc[-1]
     latest_volume = jp_volume.ffill().iloc[-1]
     budget_per_name = settings["total_budget"] / settings["top_n"]
-
     est_prices, unit_prices, est_qtys, est_amounts = [], [], [], []
     prev_volumes, volume_flags, alert_flags, notes = [], [], [], []
-
     for _, row in score_df.iterrows():
         code = row["jp_code"]
         price = latest_close.get(code, np.nan)
@@ -362,7 +515,6 @@ def calculate_suggested_quantity(score_df: pd.DataFrame, close_df: pd.DataFrame,
         volume_flags.append(vol_flag)
         alert_flags.append("|".join(alerts))
         notes.append(note)
-
     out = score_df.copy()
     out["suggested_budget"] = budget_per_name
     out["estimated_price"] = est_prices
@@ -410,10 +562,11 @@ def build_signal_log_df(score_df: pd.DataFrame, aligned_jp_index, aligned_us_ind
     out.insert(4, "計算方式", "pca_regression")
     out.insert(5, "PCA主成分数", settings["pca_components"])
     cols = [
-        "実行時刻", "シグナル日付", "使用米国日付", "使用日本日付", "計算方式", "PCA主成分数", "有効学習件数",
-        "見送り候補", "見送り理由", "1位スコア", "1位-4位差", "フィルタ通過", "除外理由",
-        "日本ETFコード", "日本ETF名", "スコア", "順位", "最終順位", "採用", "推奨予算", "推定価格",
-        "1口金額", "推奨口数", "推奨約定金額", "前日出来高", "出来高フラグ", "注意フラグ", "備考",
+        "実行時刻", "シグナル日付", "使用米国日付", "使用日本日付", "計算方式", "PCA主成分数",
+        "有効学習件数", "見送り候補", "見送り理由", "1位スコア", "1位-4位差",
+        "フィルタ通過", "除外理由", "日本ETFコード", "日本ETF名", "スコア", "順位", "最終順位",
+        "採用", "推奨予算", "推定価格", "1口金額", "推奨口数", "推奨約定金額",
+        "前日出来高", "出来高フラグ", "注意フラグ", "備考",
     ]
     return out[cols]
 
@@ -467,10 +620,12 @@ def recalc_trade_input_df(df: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         return out
     for col in ["買値", "売値", "口数"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+        out[col] = clean_numeric_series(out[col])
+    if "売買日" in out.columns:
+        out["売買日"] = out["売買日"].apply(normalize_date_like_text)
     pnl, pnl_pct, checks = [], [], []
     for _, row in out.iterrows():
-        exec_flag = str(row.get("実行有無", "") or "")
+        exec_flag = str(row.get("実行有無", "") or "").strip()
         buy, sell, qty = row.get("買値", np.nan), row.get("売値", np.nan), row.get("口数", np.nan)
         if exec_flag == "×":
             pnl.append(np.nan); pnl_pct.append(np.nan); checks.append("不要")
@@ -515,7 +670,7 @@ def build_trade_input_df(signal_df: pd.DataFrame) -> pd.DataFrame:
 
 def trade_key_series(df: pd.DataFrame) -> pd.Series:
     work = ensure_trade_columns(df)
-    dates = work["売買日"].apply(normalize_date_like)
+    dates = work["売買日"].apply(normalize_date_like_text).fillna("")
     codes = work["日本ETFコード"].fillna("").astype(str).str.strip()
     return dates + "|" + codes
 
@@ -530,23 +685,76 @@ def merge_trade_ledger(base_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFr
         new["_k"] = trade_key_series(new)
         merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["_k"], keep="last")
         merged = merged.drop(columns=["_k"], errors="ignore")
-    merged["_sort"] = pd.to_datetime(merged["売買日"], errors="coerce")
+    merged["_sort"] = pd.to_datetime(merged["売買日"].astype(str).str.replace("/", "-", regex=False), errors="coerce")
     merged = merged.sort_values(["_sort", "予定順位", "日本ETFコード"], na_position="last").drop(columns=["_sort"], errors="ignore")
     return recalc_trade_input_df(merged).reset_index(drop=True)
 
 
-def insert_blank_rows_by_date(df: pd.DataFrame, date_col: str = "売買日") -> pd.DataFrame:
-    if df.empty or date_col not in df.columns:
-        return df
-    rows = []
-    prev = None
-    for _, row in df.iterrows():
-        cur = row.get(date_col)
-        if prev is not None and cur != prev:
-            rows.append({c: "" for c in df.columns})
-        rows.append(row.to_dict())
-        prev = cur
-    return pd.DataFrame(rows, columns=df.columns)
+def append_or_replace_rows(title: str, new_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
+    base = read_ws_df(title)
+    if base.empty:
+        merged = new_df.copy()
+    else:
+        base = base.copy()
+        new = new_df.copy()
+        for col in key_cols:
+            if "日付" in col or "売買日" in col:
+                base[col] = base[col].apply(normalize_date_like_text)
+                new[col] = new[col].apply(normalize_date_like_text)
+            else:
+                base[col] = base[col].fillna("").astype(str).str.strip()
+                new[col] = new[col].fillna("").astype(str).str.strip()
+        base["_k"] = base[key_cols].fillna("").astype(str).agg("|".join, axis=1)
+        new["_k"] = new[key_cols].fillna("").astype(str).agg("|".join, axis=1)
+        merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["_k"], keep="last")
+        merged = merged.drop(columns=["_k"], errors="ignore")
+    write_ws_df(title, merged)
+    return merged
+
+
+def load_saved_state_from_sheets():
+    sys_map = load_system_map()
+    signal_df = read_ws_df("当日シグナル")
+    daily_all = read_ws_df("日次サマリー")
+    ledger_df = read_ws_df("売買記録台帳")
+    signal_date = normalize_date_like_text(sys_map.get("last_signal_date", ""))
+    if signal_date and not daily_all.empty and "シグナル日付" in daily_all.columns:
+        normalized_dates = daily_all["シグナル日付"].apply(normalize_date_like_text)
+        daily_df = daily_all[normalized_dates == signal_date].copy()
+        if daily_df.empty:
+            daily_df = daily_all.tail(1).copy()
+    else:
+        daily_df = daily_all.tail(1).copy() if not daily_all.empty else pd.DataFrame()
+    if signal_date and not ledger_df.empty and "売買日" in ledger_df.columns:
+        normalized_trade_dates = ledger_df["売買日"].apply(normalize_date_like_text)
+        trade_df = ledger_df[normalized_trade_dates == signal_date].copy()
+    else:
+        trade_df = pd.DataFrame(columns=TRADE_COLS)
+    return signal_df, daily_df, recalc_trade_input_df(trade_df), sys_map
+
+
+def save_signal_bundle(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame, settings_map: dict, signal_date: str):
+    write_ws_df("当日シグナル", signal_df)
+    append_or_replace_rows("日次サマリー", daily_df, ["シグナル日付"])
+    ledger_df = read_ws_df("売買記録台帳")
+    merged_ledger = merge_trade_ledger(ledger_df, trade_df)
+    write_ws_df("売買記録台帳", merged_ledger)
+    save_settings_map(settings_map)
+    lock_until = datetime.combine((now_jst() + timedelta(days=1)).date(), datetime.min.time(), tzinfo=JST).replace(hour=6)
+    sys_map = load_system_map()
+    sys_map["last_signal_date"] = normalize_date_like_text(signal_date)
+    sys_map["lock_until"] = lock_until.isoformat(timespec="minutes")
+    sys_map["last_saved_at"] = now_text()
+    save_system_map(sys_map)
+
+
+def is_locked(sys_map: dict):
+    last_signal_date = normalize_date_like_text(sys_map.get("last_signal_date", ""))
+    lock_until_text = sys_map.get("lock_until", "")
+    lock_dt = parse_dt_or_none(lock_until_text)
+    if lock_dt and now_jst() < lock_dt:
+        return True, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロック: {lock_dt.strftime('%Y-%m-%d %H:%M')} JST まで"
+    return False, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロックなし"
 
 
 def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -561,136 +769,8 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = vals.apply(lambda x: "" if pd.isna(x) else f"¥{x:,.0f}")
     if "損益率" in out.columns:
         vals = pd.to_numeric(out["損益率"], errors="coerce")
-        out["損益率"] = vals.apply(lambda x: "" if pd.isna(x) else f"{x * 100:.3f}%")
+        out["損益率"] = vals.apply(lambda x: "" if pd.isna(x) else f"{x * 100:.2f}%")
     return out
-
-
-# -----------------------------
-# Google Sheets helpers
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def get_gspread_client():
-    if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Secrets に [gcp_service_account] がありません。")
-    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-
-
-@st.cache_resource(show_spinner=False)
-def open_workbook():
-    client = get_gspread_client()
-    sheet_name = st.secrets.get("sheets", {}).get("spreadsheet_name", "ETF_運用台帳")
-    return client.open(sheet_name)
-
-
-def get_or_create_ws(book, title: str):
-    try:
-        return book.worksheet(title)
-    except gspread.WorksheetNotFound:
-        return book.add_worksheet(title=title, rows=200, cols=40)
-
-
-def read_ws_df(title: str) -> pd.DataFrame:
-    ws = get_or_create_ws(open_workbook(), title)
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-    headers = values[0]
-    rows = values[1:]
-    if not headers:
-        return pd.DataFrame()
-    clean_rows = [r + [""] * max(0, len(headers) - len(r)) for r in rows]
-    return pd.DataFrame(clean_rows, columns=headers)
-
-
-def write_ws_df(title: str, df: pd.DataFrame):
-    ws = get_or_create_ws(open_workbook(), title)
-    ws.clear()
-    if df is None or df.empty:
-        return
-    clean = df.fillna("").astype(str)
-    data = [clean.columns.tolist()] + clean.values.tolist()
-    ws.update(data)
-
-
-def append_or_replace_rows(title: str, new_df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
-    base = read_ws_df(title)
-    if base.empty:
-        merged = new_df.copy()
-    else:
-        base = base.copy()
-        new = new_df.copy()
-        base["_k"] = base[key_cols].fillna("").astype(str).agg("|".join, axis=1)
-        new["_k"] = new[key_cols].fillna("").astype(str).agg("|".join, axis=1)
-        merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["_k"], keep="last")
-        merged = merged.drop(columns=["_k"], errors="ignore")
-    write_ws_df(title, merged)
-    return merged
-
-
-def load_system_map() -> dict:
-    df = read_ws_df("システム")
-    if df.empty or "key" not in df.columns or "value" not in df.columns:
-        sys_df = pd.DataFrame({"key": SYSTEM_KEYS, "value": ["", "", ""]})
-        write_ws_df("システム", sys_df)
-        return {k: "" for k in SYSTEM_KEYS}
-    out = {str(r["key"]): str(r["value"]) for _, r in df.iterrows()}
-    for k in SYSTEM_KEYS:
-        out.setdefault(k, "")
-    return out
-
-
-def save_system_map(sys_map: dict):
-    df = pd.DataFrame({"key": list(sys_map.keys()), "value": [sys_map[k] for k in sys_map.keys()]})
-    write_ws_df("システム", df)
-
-
-def save_settings_sheet(settings: dict):
-    df = pd.DataFrame({"項目": list(settings.keys()), "値": list(settings.values())})
-    write_ws_df("設定", df)
-
-
-def save_signal_bundle(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame, settings: dict, signal_date: str):
-    write_ws_df("当日シグナル", signal_df)
-    append_or_replace_rows("日次サマリー", daily_df, ["シグナル日付"])
-    ledger_df = read_ws_df("売買記録台帳")
-    merged_ledger = merge_trade_ledger(ledger_df, trade_df)
-    write_ws_df("売買記録台帳", merged_ledger)
-    save_settings_sheet(settings)
-
-    lock_until = datetime.combine((now_jst() + timedelta(days=1)).date(), datetime.min.time(), tzinfo=JST).replace(hour=6)
-    sys_map = load_system_map()
-    sys_map["last_signal_date"] = normalize_date_like(signal_date)
-    sys_map["lock_until"] = lock_until.isoformat(timespec="minutes")
-    sys_map["last_saved_at"] = now_text()
-    save_system_map(sys_map)
-
-
-def load_saved_state_from_sheets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    sys_map = load_system_map()
-    signal_df = read_ws_df("当日シグナル")
-    daily_all = read_ws_df("日次サマリー")
-    ledger_df = read_ws_df("売買記録台帳")
-    signal_date = normalize_date_like(sys_map.get("last_signal_date", ""))
-
-    if not daily_all.empty and "シグナル日付" in daily_all.columns:
-        daily_all["_sig_key"] = daily_all["シグナル日付"].apply(normalize_date_like)
-    if signal_date and not daily_all.empty and "_sig_key" in daily_all.columns:
-        daily_df = daily_all[daily_all["_sig_key"] == signal_date].copy()
-        daily_df = daily_df.drop(columns=["_sig_key"], errors="ignore")
-        if daily_df.empty:
-            daily_df = daily_all.tail(1).copy()
-    else:
-        daily_df = daily_all.tail(1).copy() if not daily_all.empty else pd.DataFrame()
-
-    if not ledger_df.empty and "売買日" in ledger_df.columns:
-        ledger_df["_trade_key_date"] = ledger_df["売買日"].apply(normalize_date_like)
-    if signal_date and not ledger_df.empty and "_trade_key_date" in ledger_df.columns:
-        trade_df = ledger_df[ledger_df["_trade_key_date"] == signal_date].copy()
-        trade_df = trade_df.drop(columns=["_trade_key_date"], errors="ignore")
-    else:
-        trade_df = pd.DataFrame(columns=TRADE_COLS)
-
-    return signal_df, daily_df, recalc_trade_input_df(trade_df), sys_map
 
 
 def make_excel_download(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df: pd.DataFrame) -> bytes:
@@ -707,58 +787,41 @@ def make_csv_download(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def is_locked(sys_map: dict) -> tuple[bool, str]:
-    last_signal_date = sys_map.get("last_signal_date", "")
-    lock_until_text = sys_map.get("lock_until", "")
-    lock_dt = parse_dt_or_none(lock_until_text)
-    if lock_dt and now_jst() < lock_dt:
-        return True, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロック: {lock_dt.strftime('%Y-%m-%d %H:%M')} JST まで"
-    return False, f"前回確定日: {last_signal_date or '未設定'} / 再計算ロックなし"
-
-
-# -----------------------------
-# UI
-# -----------------------------
 st.title("日米時差ETF戦略 / Google Sheets 保存版")
-st.caption("朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しない運用を想定")
+st.caption("設定シート・システムシート対応。朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しません。")
+
+try:
+    ensure_base_sheets_and_defaults()
+except Exception as e:
+    st.error(f"Google Sheets 初期化エラー: {e}")
+    st.stop()
+
+settings_map = load_settings_map()
+settings = jp_settings_to_internal(settings_map)
+system_map = load_system_map()
 
 with st.sidebar:
-    st.subheader("設定")
-    total_budget = st.number_input("総投資額", min_value=100000, value=DEFAULTS["total_budget"], step=100000)
-    top_n = st.number_input("最大採用本数", min_value=1, max_value=10, value=DEFAULTS["top_n"], step=1)
-    rolling_window = st.number_input("ローリング窓", min_value=20, max_value=240, value=DEFAULTS["rolling_window"], step=5)
-    min_history = st.number_input("最低必要履歴数", min_value=20, max_value=240, value=DEFAULTS["min_history"], step=5)
-    pca_components = st.number_input("PCA主成分数", min_value=1, max_value=10, value=DEFAULTS["pca_components"], step=1)
-    min_score_spread = st.number_input("MIN_SCORE_SPREAD", min_value=0.0, value=float(DEFAULTS["min_score_spread"]), step=0.0001, format="%.4f")
-    use_volume_filter = st.checkbox("出来高フィルタを使う", value=DEFAULTS["use_volume_filter"])
-    require_positive_score = st.checkbox("スコア>0のみ採用", value=DEFAULTS["require_positive_score"])
-    min_suggested_qty = st.number_input("最小推奨口数", min_value=1, max_value=1000, value=DEFAULTS["min_suggested_qty"], step=1)
+    st.subheader("現在の設定（設定シートを使用）")
+    st.write(f"モード: **{settings['mode']}**")
+    st.write(f"総投資額: **{settings['total_budget']:,}**")
+    st.write(f"最大採用本数: **{settings['top_n']}**")
+    st.write(f"ローリング窓: **{settings['rolling_window']}**")
+    st.write(f"PCA主成分数: **{settings['pca_components']}**")
+    st.write(f"MIN_SCORE_SPREAD: **{settings['min_score_spread']:.4f}**")
+    st.write(f"スコア>0のみ採用: **{'ON' if settings['require_positive_score'] else 'OFF'}**")
+    st.write(f"出来高フィルタ: **{'ON' if settings['use_volume_filter'] else 'OFF'}**")
     reload_button = st.button("保存済みデータを再読込", use_container_width=True)
     run_button = st.button("朝の確定計算を実行", type="primary", use_container_width=True)
-
-settings = {
-    **DEFAULTS,
-    "total_budget": int(total_budget),
-    "top_n": int(top_n),
-    "rolling_window": int(rolling_window),
-    "min_history": int(min_history),
-    "pca_components": int(pca_components),
-    "min_score_spread": float(min_score_spread),
-    "use_volume_filter": bool(use_volume_filter),
-    "require_positive_score": bool(require_positive_score),
-    "min_suggested_qty": int(min_suggested_qty),
-}
 
 for key, default in {
     "signal_df": pd.DataFrame(),
     "daily_df": pd.DataFrame(),
     "trade_df": pd.DataFrame(columns=TRADE_COLS),
-    "system_map": {k: "" for k in SYSTEM_KEYS},
+    "system_map": system_map,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# initial load / reload
 if reload_button or st.session_state["signal_df"].empty:
     try:
         signal_df, daily_df, trade_df, sys_map = load_saved_state_from_sheets()
@@ -777,7 +840,7 @@ st.info(lock_text)
 
 if run_button:
     if locked:
-        st.warning("今回は再計算しません。保存済みデータをそのまま使ってください。テスト時は Google Sheets の『システム』シートで lock_until を過去日時へ変更してください。")
+        st.warning("今回は再計算しません。保存済みデータをそのまま使ってください。テスト時は Google Sheets の『システム』シートで lock_until を過去日時へ変更するか、last_signal_date を空欄にしてください。")
     else:
         try:
             with st.spinner("朝の確定計算を実行して Google Sheets へ保存中..."):
@@ -794,10 +857,9 @@ if run_button:
                 signal_df = build_signal_log_df(score_df, aligned_jp.index, aligned_us.index, settings)
                 daily_df = build_daily_summary_df(signal_df)
                 trade_df = build_trade_input_df(signal_df)
-                signal_date = normalize_date_like(daily_df.iloc[0]["シグナル日付"])
-                save_signal_bundle(signal_df, daily_df, trade_df, settings, signal_date)
+                signal_date = str(daily_df.iloc[0]["シグナル日付"])
+                save_signal_bundle(signal_df, daily_df, trade_df, settings_map, signal_date)
                 signal_df, daily_df, trade_df, sys_map = load_saved_state_from_sheets()
-
             st.session_state["signal_df"] = signal_df
             st.session_state["daily_df"] = daily_df
             st.session_state["trade_df"] = trade_df
@@ -881,6 +943,38 @@ if not signal_df.empty:
             file_name=f"trade_input_{signal_date}.csv",
             mime="text/csv",
             use_container_width=True,
+        )
+
+    with st.expander("空のスプレッドシートに必要な項目"):
+        st.markdown(
+            """
+### 設定シート
+列は **項目 / 値** の2列です。初期項目は次です。
+
+- モード
+- 総投資額
+- 最大採用本数
+- ローリング窓
+- 最低必要履歴数
+- PCA主成分数
+- リッジ係数
+- MIN_SCORE_SPREAD
+- 1位スコア<=0で見送り候補
+- スコア>0のみ採用
+- 出来高フィルタを使う
+- 最小推奨口数
+- 数量計算安全係数
+- 最低平均出来高
+- 低単価しきい値
+- 口数多めしきい値
+
+### システムシート
+列は **key / value** の2列です。初期項目は次です。
+
+- last_signal_date
+- lock_until
+- last_saved_at
+            """
         )
 
     with st.expander("テスト時の再計算解除方法"):
