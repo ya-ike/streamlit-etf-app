@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2026-04-10-ops-09"
+APP_VERSION = "v2026-04-10-ops-10"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
@@ -866,7 +866,6 @@ def save_signal_bundle(signal_df: pd.DataFrame, daily_df: pd.DataFrame, trade_df
     ledger_df = read_ws_df("売買記録台帳")
     merged_ledger = merge_trade_ledger(ledger_df, trade_df)
     write_ws_df("売買記録台帳", merged_ledger)
-    save_settings_map(settings_map)
     lock_until = datetime.combine((now_jst() + timedelta(days=1)).date(), datetime.min.time(), tzinfo=JST).replace(hour=6)
     sys_map = load_system_map()
     sys_map["last_signal_date"] = normalize_date_like_text(signal_date)
