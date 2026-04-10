@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2026-04-10-ops-11"
+APP_VERSION = "v2026-04-10-ops-12"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
@@ -211,15 +211,20 @@ def list_worksheets_map(book):
     return {ws.title: ws for ws in ws_list}
 
 
+@st.cache_resource(show_spinner=False)
+def get_ws_map():
+    return list_worksheets_map(open_workbook())
+
+
 def get_or_create_ws(book, title: str, ws_map: dict | None = None):
-    if ws_map is not None and title in ws_map:
+    if ws_map is None:
+        ws_map = get_ws_map()
+    if title in ws_map:
         return ws_map[title]
-    try:
-        ws = api_retry(book.worksheet, title)
-    except gspread.WorksheetNotFound:
-        ws = api_retry(book.add_worksheet, title=title, rows=300, cols=60)
-    if ws_map is not None:
-        ws_map[title] = ws
+    if book is None:
+        book = open_workbook()
+    ws = api_retry(book.add_worksheet, title=title, rows=300, cols=60)
+    ws_map[title] = ws
     return ws
 
 
@@ -241,13 +246,13 @@ def read_values_df(values):
 
 
 def read_ws_df(title: str) -> pd.DataFrame:
-    ws = get_or_create_ws(open_workbook(), title)
+    ws = get_or_create_ws(None, title)
     values = api_retry(ws.get_all_values)
     return read_values_df(values)
 
 
 def write_ws_df(title: str, df: pd.DataFrame):
-    ws = get_or_create_ws(open_workbook(), title)
+    ws = get_or_create_ws(None, title)
     api_retry(ws.clear)
     if df is None or df.empty:
         return
