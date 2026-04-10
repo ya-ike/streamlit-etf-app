@@ -19,6 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
+APP_VERSION = "v2026-04-10-ops-07"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
@@ -823,7 +824,7 @@ def make_csv_download(df: pd.DataFrame) -> bytes:
 
 
 st.title("日米時差ETF戦略 / Google Sheets 保存版")
-st.caption("設定シート・システムシート対応。朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しません。")
+st.caption(f"設定シート・システムシート対応。朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しません。 / {APP_VERSION}")
 
 try:
     ensure_base_sheets_and_defaults()
