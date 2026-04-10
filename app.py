@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2026-04-10-ops-07"
+APP_VERSION = "v2026-04-10-ops-08"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
