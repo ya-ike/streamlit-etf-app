@@ -58,8 +58,8 @@ JP_ETFS = {
 }
 ALL_TICKERS = list(US_ETFS.keys()) + list(JP_ETFS.keys())
 
-DEFAULT_SETTINGS_JP = {
-    "モード": "実運用",
+
+DEFAULT_PRACTICAL_SETTINGS_JP = {
     "総投資額": "600000",
     "最大採用本数": "3",
     "ローリング窓": "60",
@@ -76,7 +76,29 @@ DEFAULT_SETTINGS_JP = {
     "低単価しきい値": "1000",
     "口数多めしきい値": "100",
 }
+
+DEFAULT_PAPER_SETTINGS_JP = {
+    "総投資額": "600000",
+    "最大採用本数": "3",
+    "ローリング窓": "60",
+    "最低必要履歴数": "40",
+    "PCA主成分数": "3",
+    "リッジ係数": "0.000001",
+    "MIN_SCORE_SPREAD": "0.0000",
+    "1位スコア<=0で見送り候補": "FALSE",
+    "スコア>0のみ採用": "FALSE",
+    "出来高フィルタを使う": "FALSE",
+    "最小推奨口数": "1",
+    "数量計算安全係数": "1.02",
+    "最低平均出来高": "1000",
+    "低単価しきい値": "1000",
+    "口数多めしきい値": "100",
+}
+
+SETTING_ITEMS_JP = list(DEFAULT_PRACTICAL_SETTINGS_JP.keys())
+
 DEFAULT_SYSTEM_JP = {
+    "selected_mode": "実運用",
     "last_signal_date": "",
     "lock_until": "",
     "last_saved_at": "",
@@ -234,34 +256,66 @@ def write_ws_df(title: str, df: pd.DataFrame):
     api_retry(ws.update, data)
 
 
+
+def build_settings_sheet_df(practical_map: dict | None = None, paper_map: dict | None = None) -> pd.DataFrame:
+    practical_map = practical_map or DEFAULT_PRACTICAL_SETTINGS_JP.copy()
+    paper_map = paper_map or DEFAULT_PAPER_SETTINGS_JP.copy()
+    rows = []
+    for item in SETTING_ITEMS_JP:
+        p_val = str(practical_map.get(item, DEFAULT_PRACTICAL_SETTINGS_JP[item])).strip()
+        r_val = str(paper_map.get(item, DEFAULT_PAPER_SETTINGS_JP[item])).strip()
+        if p_val == "":
+            p_val = DEFAULT_PRACTICAL_SETTINGS_JP[item]
+        if r_val == "":
+            r_val = DEFAULT_PAPER_SETTINGS_JP[item]
+        rows.append({"項目": item, "実運用値": p_val, "論文寄り値": r_val})
+    return pd.DataFrame(rows)
+
+
 def ensure_base_sheets_and_defaults():
     book = open_workbook()
     ws_map = list_worksheets_map(book)
 
-    # 必要シートを1回のメタデータ取得で確認
     for title in SHEET_TITLES:
         get_or_create_ws(book, title, ws_map)
 
-    # 設定シート
     settings_ws = get_or_create_ws(book, "設定", ws_map)
     settings_df = read_values_df(api_retry(settings_ws.get_all_values))
-    if settings_df.empty or "項目" not in settings_df.columns or "値" not in settings_df.columns:
-        df = pd.DataFrame({"項目": list(DEFAULT_SETTINGS_JP.keys()), "値": list(DEFAULT_SETTINGS_JP.values())})
-        api_retry(settings_ws.clear)
-        api_retry(settings_ws.update, [df.columns.tolist()] + df.values.tolist())
-    else:
-        current = {str(r["項目"]).strip(): str(r["値"]).strip() for _, r in settings_df.iterrows()}
-        changed = False
-        for k, v in DEFAULT_SETTINGS_JP.items():
-            if k not in current:
-                current[k] = v
-                changed = True
-        if changed:
-            df = pd.DataFrame({"項目": list(current.keys()), "値": list(current.values())})
-            api_retry(settings_ws.clear)
-            api_retry(settings_ws.update, [df.columns.tolist()] + df.values.tolist())
+    rewrite_settings = False
 
-    # システムシート
+    if settings_df.empty:
+        settings_out = build_settings_sheet_df()
+        rewrite_settings = True
+    elif {"項目", "実運用値", "論文寄り値"}.issubset(settings_df.columns):
+        practical_map = {}
+        paper_map = {}
+        for _, r in settings_df.iterrows():
+            item = str(r.get("項目", "")).strip()
+            if item == "":
+                continue
+            practical_map[item] = str(r.get("実運用値", "")).strip()
+            paper_map[item] = str(r.get("論文寄り値", "")).strip()
+        settings_out = build_settings_sheet_df(practical_map, paper_map)
+        if settings_out.to_dict("records") != settings_df[["項目", "実運用値", "論文寄り値"]].fillna("").astype(str).to_dict("records"):
+            rewrite_settings = True
+    elif {"項目", "値"}.issubset(settings_df.columns):
+        # 旧形式から移行
+        practical_map = {}
+        for _, r in settings_df.iterrows():
+            item = str(r.get("項目", "")).strip()
+            if item == "" or item == "モード":
+                continue
+            practical_map[item] = str(r.get("値", "")).strip()
+        settings_out = build_settings_sheet_df(practical_map, DEFAULT_PAPER_SETTINGS_JP.copy())
+        rewrite_settings = True
+    else:
+        settings_out = build_settings_sheet_df()
+        rewrite_settings = True
+
+    if rewrite_settings:
+        api_retry(settings_ws.clear)
+        api_retry(settings_ws.update, [settings_out.columns.tolist()] + settings_out.values.tolist())
+
     system_ws = get_or_create_ws(book, "システム", ws_map)
     system_df = read_values_df(api_retry(system_ws.get_all_values))
     if system_df.empty or "key" not in system_df.columns or "value" not in system_df.columns:
@@ -272,7 +326,7 @@ def ensure_base_sheets_and_defaults():
         current = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in system_df.iterrows()}
         changed = False
         for k, v in DEFAULT_SYSTEM_JP.items():
-            if k not in current:
+            if k not in current or str(current.get(k, "")).strip() == "":
                 current[k] = v
                 changed = True
         if changed:
@@ -281,19 +335,59 @@ def ensure_base_sheets_and_defaults():
             api_retry(system_ws.update, [df.columns.tolist()] + df.values.tolist())
 
 
-def load_settings_map() -> dict:
+def load_settings_table() -> pd.DataFrame:
     df = read_ws_df("設定")
-    if df.empty:
-        return DEFAULT_SETTINGS_JP.copy()
-    out = {str(r["項目"]).strip(): str(r["値"]).strip() for _, r in df.iterrows()}
-    for k, v in DEFAULT_SETTINGS_JP.items():
-        out.setdefault(k, v)
+    if df.empty or not {"項目", "実運用値", "論文寄り値"}.issubset(df.columns):
+        return build_settings_sheet_df()
+    # 空欄は初期値へ戻す
+    practical_map = {}
+    paper_map = {}
+    changed = False
+    for _, r in df.iterrows():
+        item = str(r.get("項目", "")).strip()
+        if item == "":
+            continue
+        p_val = str(r.get("実運用値", "")).strip()
+        r_val = str(r.get("論文寄り値", "")).strip()
+        if p_val == "":
+            p_val = DEFAULT_PRACTICAL_SETTINGS_JP.get(item, "")
+            changed = True
+        if r_val == "":
+            r_val = DEFAULT_PAPER_SETTINGS_JP.get(item, "")
+            changed = True
+        practical_map[item] = p_val
+        paper_map[item] = r_val
+    out = build_settings_sheet_df(practical_map, paper_map)
+    if changed:
+        write_ws_df("設定", out)
     return out
 
 
-def save_settings_map(settings_map: dict):
-    df = pd.DataFrame({"項目": list(settings_map.keys()), "値": [settings_map[k] for k in settings_map.keys()]})
-    write_ws_df("設定", df)
+def save_settings_table(settings_df: pd.DataFrame):
+    write_ws_df("設定", settings_df)
+
+
+def settings_table_to_map(settings_df: pd.DataFrame, mode: str) -> dict:
+    mode_col = "論文寄り値" if mode == "論文寄り" else "実運用値"
+    out = {}
+    for _, r in settings_df.iterrows():
+        item = str(r.get("項目", "")).strip()
+        if item == "":
+            continue
+        out[item] = str(r.get(mode_col, "")).strip()
+    defaults = DEFAULT_PAPER_SETTINGS_JP if mode == "論文寄り" else DEFAULT_PRACTICAL_SETTINGS_JP
+    for k, v in defaults.items():
+        if str(out.get(k, "")).strip() == "":
+            out[k] = v
+    out["モード"] = mode
+    return out
+
+
+def load_settings_map(mode: str | None = None) -> dict:
+    settings_df = load_settings_table()
+    if mode is None:
+        mode = load_system_map().get("selected_mode", "実運用")
+    return settings_table_to_map(settings_df, mode)
 
 
 def load_system_map() -> dict:
@@ -303,6 +397,8 @@ def load_system_map() -> dict:
     out = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in df.iterrows()}
     for k, v in DEFAULT_SYSTEM_JP.items():
         out.setdefault(k, v)
+        if str(out.get(k, "")).strip() == "":
+            out[k] = v
     return out
 
 
@@ -315,27 +411,22 @@ def jp_settings_to_internal(settings_map: dict) -> dict:
     mode = settings_map.get("モード", "実運用").strip() or "実運用"
     internal = {
         "mode": mode,
-        "total_budget": int(float(settings_map.get("総投資額", DEFAULT_SETTINGS_JP["総投資額"]))),
-        "top_n": int(float(settings_map.get("最大採用本数", DEFAULT_SETTINGS_JP["最大採用本数"]))),
-        "rolling_window": int(float(settings_map.get("ローリング窓", DEFAULT_SETTINGS_JP["ローリング窓"]))),
-        "min_history": int(float(settings_map.get("最低必要履歴数", DEFAULT_SETTINGS_JP["最低必要履歴数"]))),
-        "pca_components": int(float(settings_map.get("PCA主成分数", DEFAULT_SETTINGS_JP["PCA主成分数"]))),
-        "ridge_alpha": float(settings_map.get("リッジ係数", DEFAULT_SETTINGS_JP["リッジ係数"])),
-        "min_score_spread": float(settings_map.get("MIN_SCORE_SPREAD", DEFAULT_SETTINGS_JP["MIN_SCORE_SPREAD"])),
-        "skip_if_top1_leq_zero": parse_bool_jp(settings_map.get("1位スコア<=0で見送り候補", DEFAULT_SETTINGS_JP["1位スコア<=0で見送り候補"]), True),
-        "require_positive_score": parse_bool_jp(settings_map.get("スコア>0のみ採用", DEFAULT_SETTINGS_JP["スコア>0のみ採用"]), True),
-        "use_volume_filter": parse_bool_jp(settings_map.get("出来高フィルタを使う", DEFAULT_SETTINGS_JP["出来高フィルタを使う"]), False),
-        "min_suggested_qty": int(float(settings_map.get("最小推奨口数", DEFAULT_SETTINGS_JP["最小推奨口数"]))),
-        "min_price_buffer": float(settings_map.get("数量計算安全係数", DEFAULT_SETTINGS_JP["数量計算安全係数"])),
-        "min_avg_volume": int(float(settings_map.get("最低平均出来高", DEFAULT_SETTINGS_JP["最低平均出来高"]))),
-        "low_price_threshold": float(settings_map.get("低単価しきい値", DEFAULT_SETTINGS_JP["低単価しきい値"])),
-        "high_qty_threshold": float(settings_map.get("口数多めしきい値", DEFAULT_SETTINGS_JP["口数多めしきい値"])),
+        "total_budget": int(float(settings_map.get("総投資額", DEFAULT_PRACTICAL_SETTINGS_JP["総投資額"]))),
+        "top_n": int(float(settings_map.get("最大採用本数", DEFAULT_PRACTICAL_SETTINGS_JP["最大採用本数"]))),
+        "rolling_window": int(float(settings_map.get("ローリング窓", DEFAULT_PRACTICAL_SETTINGS_JP["ローリング窓"]))),
+        "min_history": int(float(settings_map.get("最低必要履歴数", DEFAULT_PRACTICAL_SETTINGS_JP["最低必要履歴数"]))),
+        "pca_components": int(float(settings_map.get("PCA主成分数", DEFAULT_PRACTICAL_SETTINGS_JP["PCA主成分数"]))),
+        "ridge_alpha": float(settings_map.get("リッジ係数", DEFAULT_PRACTICAL_SETTINGS_JP["リッジ係数"])),
+        "min_score_spread": float(settings_map.get("MIN_SCORE_SPREAD", DEFAULT_PRACTICAL_SETTINGS_JP["MIN_SCORE_SPREAD"])),
+        "skip_if_top1_leq_zero": parse_bool_jp(settings_map.get("1位スコア<=0で見送り候補", DEFAULT_PRACTICAL_SETTINGS_JP["1位スコア<=0で見送り候補"]), True),
+        "require_positive_score": parse_bool_jp(settings_map.get("スコア>0のみ採用", DEFAULT_PRACTICAL_SETTINGS_JP["スコア>0のみ採用"]), True),
+        "use_volume_filter": parse_bool_jp(settings_map.get("出来高フィルタを使う", DEFAULT_PRACTICAL_SETTINGS_JP["出来高フィルタを使う"]), False),
+        "min_suggested_qty": int(float(settings_map.get("最小推奨口数", DEFAULT_PRACTICAL_SETTINGS_JP["最小推奨口数"]))),
+        "min_price_buffer": float(settings_map.get("数量計算安全係数", DEFAULT_PRACTICAL_SETTINGS_JP["数量計算安全係数"])),
+        "min_avg_volume": int(float(settings_map.get("最低平均出来高", DEFAULT_PRACTICAL_SETTINGS_JP["最低平均出来高"]))),
+        "low_price_threshold": float(settings_map.get("低単価しきい値", DEFAULT_PRACTICAL_SETTINGS_JP["低単価しきい値"])),
+        "high_qty_threshold": float(settings_map.get("口数多めしきい値", DEFAULT_PRACTICAL_SETTINGS_JP["口数多めしきい値"])),
     }
-    if mode == "論文寄り":
-        internal["use_volume_filter"] = False
-        internal["require_positive_score"] = False
-        internal["skip_if_top1_leq_zero"] = False
-        internal["min_score_spread"] = 0.0
     return internal
 
 
@@ -824,7 +915,7 @@ def make_csv_download(df: pd.DataFrame) -> bytes:
 
 
 st.title("日米時差ETF戦略 / Google Sheets 保存版")
-st.caption(f"設定シート・システムシート対応。朝に1回だけ確定計算し、翌日06:00(JST)まで再計算しません。 / {APP_VERSION}")
+st.caption(f"設定シートは 実運用値 / 論文寄り値 の2系統対応。モードは画面左で選択し、朝に1回だけ確定計算します。 / {APP_VERSION}")
 
 try:
     ensure_base_sheets_and_defaults()
@@ -832,23 +923,39 @@ except Exception as e:
     st.error(f"Google Sheets 初期化エラー: {e}")
     st.stop()
 
-settings_map = load_settings_map()
-settings = jp_settings_to_internal(settings_map)
 system_map = load_system_map()
+current_mode = system_map.get("selected_mode", "実運用")
+settings_table = load_settings_table()
+settings_map = settings_table_to_map(settings_table, current_mode)
+settings = jp_settings_to_internal(settings_map)
 
 with st.sidebar:
-    st.subheader("現在の設定（設定シートを使用）")
-    st.write(f"モード: **{settings['mode']}**")
-    st.write(f"総投資額: **{settings['total_budget']:,}**")
-    st.write(f"最大採用本数: **{settings['top_n']}**")
-    st.write(f"ローリング窓: **{settings['rolling_window']}**")
-    st.write(f"PCA主成分数: **{settings['pca_components']}**")
-    st.write(f"MIN_SCORE_SPREAD: **{settings['min_score_spread']:.4f}**")
-    st.write(f"スコア>0のみ採用: **{'ON' if settings['require_positive_score'] else 'OFF'}**")
-    st.write(f"出来高フィルタ: **{'ON' if settings['use_volume_filter'] else 'OFF'}**")
+    st.subheader("現在の設定")
+    selected_mode = st.selectbox("モード選択", ["実運用", "論文寄り"], index=0 if current_mode == "実運用" else 1)
+    if st.button("モードを保存", use_container_width=True):
+        system_map["selected_mode"] = selected_mode
+        save_system_map(system_map)
+        st.success("モードを保存しました。")
+        st.rerun()
+
+    effective_map = settings_table_to_map(settings_table, selected_mode)
+    effective_settings = jp_settings_to_internal(effective_map)
+
+    st.write(f"現在モード: **{selected_mode}**")
+    st.write(f"総投資額: **{effective_settings['total_budget']:,}**")
+    st.write(f"最大採用本数: **{effective_settings['top_n']}**")
+    st.write(f"ローリング窓: **{effective_settings['rolling_window']}**")
+    st.write(f"PCA主成分数: **{effective_settings['pca_components']}**")
+    st.write(f"MIN_SCORE_SPREAD: **{effective_settings['min_score_spread']:.4f}**")
+    st.write(f"スコア>0のみ採用: **{'ON' if effective_settings['require_positive_score'] else 'OFF'}**")
+    st.write(f"出来高フィルタ: **{'ON' if effective_settings['use_volume_filter'] else 'OFF'}**")
     reload_button = st.button("保存済みデータを再読込", use_container_width=True)
     run_button = st.button("朝の確定計算を実行", type="primary", use_container_width=True)
 
+
+settings_map = settings_table_to_map(settings_table, selected_mode)
+settings = jp_settings_to_internal(settings_map)
+system_map['selected_mode'] = selected_mode
 for key, default in {
     "signal_df": pd.DataFrame(),
     "daily_df": pd.DataFrame(),
@@ -985,9 +1092,8 @@ if not signal_df.empty:
         st.markdown(
             """
 ### 設定シート
-列は **項目 / 値** の2列です。初期項目は次です。
+列は **項目 / 実運用値 / 論文寄り値** の3列です。初期項目は次です。
 
-- モード
 - 総投資額
 - 最大採用本数
 - ローリング窓
@@ -1007,6 +1113,7 @@ if not signal_df.empty:
 ### システムシート
 列は **key / value** の2列です。初期項目は次です。
 
+- selected_mode
 - last_signal_date
 - lock_until
 - last_saved_at
