@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2026-04-10-ops-10"
+APP_VERSION = "v2026-04-10-ops-11"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
@@ -273,16 +273,18 @@ def build_settings_sheet_df(practical_map: dict | None = None, paper_map: dict |
 
 
 def ensure_base_sheets_and_defaults():
+    """起動時は設定/システムだけを最小限確認する。"""
     book = open_workbook()
-    ws_map = list_worksheets_map(book)
 
-    for title in SHEET_TITLES:
-        get_or_create_ws(book, title, ws_map)
+    # 設定
+    try:
+        settings_ws = get_or_create_ws(book, "設定")
+        settings_df = read_values_df(api_retry(settings_ws.get_all_values))
+    except Exception:
+        settings_ws = api_retry(book.add_worksheet, title="設定", rows=100, cols=10)
+        settings_df = pd.DataFrame()
 
-    settings_ws = get_or_create_ws(book, "設定", ws_map)
-    settings_df = read_values_df(api_retry(settings_ws.get_all_values))
     rewrite_settings = False
-
     if settings_df.empty:
         settings_out = build_settings_sheet_df()
         rewrite_settings = True
@@ -296,10 +298,10 @@ def ensure_base_sheets_and_defaults():
             practical_map[item] = str(r.get("実運用値", "")).strip()
             paper_map[item] = str(r.get("論文寄り値", "")).strip()
         settings_out = build_settings_sheet_df(practical_map, paper_map)
-        if settings_out.to_dict("records") != settings_df[["項目", "実運用値", "論文寄り値"]].fillna("").astype(str).to_dict("records"):
+        current_records = settings_df[["項目", "実運用値", "論文寄り値"]].fillna("").astype(str).to_dict("records")
+        if settings_out.to_dict("records") != current_records:
             rewrite_settings = True
     elif {"項目", "値"}.issubset(settings_df.columns):
-        # 旧形式から移行
         practical_map = {}
         for _, r in settings_df.iterrows():
             item = str(r.get("項目", "")).strip()
@@ -316,8 +318,14 @@ def ensure_base_sheets_and_defaults():
         api_retry(settings_ws.clear)
         api_retry(settings_ws.update, [settings_out.columns.tolist()] + settings_out.values.tolist())
 
-    system_ws = get_or_create_ws(book, "システム", ws_map)
-    system_df = read_values_df(api_retry(system_ws.get_all_values))
+    # システム
+    try:
+        system_ws = get_or_create_ws(book, "システム")
+        system_df = read_values_df(api_retry(system_ws.get_all_values))
+    except Exception:
+        system_ws = api_retry(book.add_worksheet, title="システム", rows=50, cols=10)
+        system_df = pd.DataFrame()
+
     if system_df.empty or "key" not in system_df.columns or "value" not in system_df.columns:
         df = pd.DataFrame({"key": list(DEFAULT_SYSTEM_JP.keys()), "value": list(DEFAULT_SYSTEM_JP.values())})
         api_retry(system_ws.clear)
@@ -326,7 +334,7 @@ def ensure_base_sheets_and_defaults():
         current = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in system_df.iterrows()}
         changed = False
         for k, v in DEFAULT_SYSTEM_JP.items():
-            if k not in current or str(current.get(k, "")).strip() == "":
+            if k not in current:
                 current[k] = v
                 changed = True
         if changed:
@@ -338,8 +346,9 @@ def ensure_base_sheets_and_defaults():
 def load_settings_table() -> pd.DataFrame:
     df = read_ws_df("設定")
     if df.empty or not {"項目", "実運用値", "論文寄り値"}.issubset(df.columns):
-        return build_settings_sheet_df()
-    # 空欄は初期値へ戻す
+        out = build_settings_sheet_df()
+        write_ws_df("設定", out)
+        return out
     practical_map = {}
     paper_map = {}
     changed = False
@@ -363,10 +372,6 @@ def load_settings_table() -> pd.DataFrame:
     return out
 
 
-def save_settings_table(settings_df: pd.DataFrame):
-    write_ws_df("設定", settings_df)
-
-
 def settings_table_to_map(settings_df: pd.DataFrame, mode: str) -> dict:
     mode_col = "論文寄り値" if mode == "論文寄り" else "実運用値"
     out = {}
@@ -383,28 +388,28 @@ def settings_table_to_map(settings_df: pd.DataFrame, mode: str) -> dict:
     return out
 
 
-def load_settings_map(mode: str | None = None) -> dict:
-    settings_df = load_settings_table()
-    if mode is None:
-        mode = load_system_map().get("selected_mode", "実運用")
-    return settings_table_to_map(settings_df, mode)
-
-
 def load_system_map() -> dict:
     df = read_ws_df("システム")
-    if df.empty:
+    if df.empty or "key" not in df.columns or "value" not in df.columns:
         return DEFAULT_SYSTEM_JP.copy()
     out = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in df.iterrows()}
     for k, v in DEFAULT_SYSTEM_JP.items():
         out.setdefault(k, v)
-        if str(out.get(k, "")).strip() == "":
-            out[k] = v
     return out
 
 
 def save_system_map(sys_map: dict):
     df = pd.DataFrame({"key": list(sys_map.keys()), "value": [sys_map[k] for k in sys_map.keys()]})
     write_ws_df("システム", df)
+
+
+def load_settings_map(mode: str | None = None, system_map: dict | None = None) -> dict:
+    settings_df = load_settings_table()
+    if mode is None:
+        if system_map is None:
+            system_map = load_system_map()
+        mode = system_map.get("selected_mode", "実運用")
+    return settings_table_to_map(settings_df, mode)
 
 
 def jp_settings_to_internal(settings_map: dict) -> dict:
