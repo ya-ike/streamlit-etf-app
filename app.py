@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2026-04-10-ops-08"
+APP_VERSION = "v2026-04-10-ops-09"
 
 st.set_page_config(page_title="日米時差ETF戦略", page_icon="📈", layout="wide")
 
@@ -929,15 +929,22 @@ settings_table = load_settings_table()
 settings_map = settings_table_to_map(settings_table, current_mode)
 settings = jp_settings_to_internal(settings_map)
 
-with st.sidebar:
-    st.subheader("現在の設定")
-    selected_mode = st.selectbox("モード選択", ["実運用", "論文寄り"], index=0 if current_mode == "実運用" else 1)
-    if st.button("モードを保存", use_container_width=True):
-        system_map["selected_mode"] = selected_mode
+st.subheader("モード切替")
+col_m1, col_m2 = st.columns([2,1])
+with col_m1:
+    selected_mode_main = st.selectbox("計算モード", ["実運用", "論文寄り"], index=0 if current_mode == "実運用" else 1, key="selected_mode_main")
+with col_m2:
+    st.write("")
+    if st.button("モードを保存", key="save_mode_main", use_container_width=True):
+        system_map["selected_mode"] = selected_mode_main
         save_system_map(system_map)
         st.success("モードを保存しました。")
         st.rerun()
 
+selected_mode = selected_mode_main
+
+with st.sidebar:
+    st.subheader("現在の設定")
     effective_map = settings_table_to_map(settings_table, selected_mode)
     effective_settings = jp_settings_to_internal(effective_map)
 
