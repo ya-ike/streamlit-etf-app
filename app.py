@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from io import BytesIO
 from zoneinfo import ZoneInfo
+import time
 
 import gspread
 import numpy as np
@@ -169,53 +170,84 @@ def open_workbook():
     return client.open(sheet_name)
 
 
-def get_or_create_ws(book, title: str):
+def api_retry(func, *args, **kwargs):
+    last_err = None
+    for i in range(4):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            last_err = e
+            if i == 3:
+                break
+            time.sleep(1.0 * (2 ** i))
+    raise last_err
+
+
+def list_worksheets_map(book):
+    ws_list = api_retry(book.worksheets)
+    return {ws.title: ws for ws in ws_list}
+
+
+def get_or_create_ws(book, title: str, ws_map: dict | None = None):
+    if ws_map is not None and title in ws_map:
+        return ws_map[title]
     try:
-        return book.worksheet(title)
+        ws = api_retry(book.worksheet, title)
     except gspread.WorksheetNotFound:
-        return book.add_worksheet(title=title, rows=300, cols=60)
+        ws = api_retry(book.add_worksheet, title=title, rows=300, cols=60)
+    if ws_map is not None:
+        ws_map[title] = ws
+    return ws
 
 
-def read_ws_df(title: str) -> pd.DataFrame:
-    ws = get_or_create_ws(open_workbook(), title)
-    values = ws.get_all_values()
+def read_values_df(values):
     if not values:
         return pd.DataFrame()
     headers = values[0]
     rows = values[1:]
     if not headers:
         return pd.DataFrame()
-
     clean_rows = []
     for r in rows:
         padded = r + [""] * max(0, len(headers) - len(r))
         if any(str(x).strip() != "" for x in padded):
             clean_rows.append(padded[:len(headers)])
-
     if not clean_rows:
         return pd.DataFrame(columns=headers)
     return pd.DataFrame(clean_rows, columns=headers)
 
 
+def read_ws_df(title: str) -> pd.DataFrame:
+    ws = get_or_create_ws(open_workbook(), title)
+    values = api_retry(ws.get_all_values)
+    return read_values_df(values)
+
+
 def write_ws_df(title: str, df: pd.DataFrame):
     ws = get_or_create_ws(open_workbook(), title)
-    ws.clear()
+    api_retry(ws.clear)
     if df is None or df.empty:
         return
     clean = df.copy().fillna("")
     data = [clean.columns.tolist()] + clean.values.tolist()
-    ws.update(data)
+    api_retry(ws.update, data)
 
 
 def ensure_base_sheets_and_defaults():
     book = open_workbook()
-    for title in SHEET_TITLES:
-        get_or_create_ws(book, title)
+    ws_map = list_worksheets_map(book)
 
-    settings_df = read_ws_df("設定")
+    # 必要シートを1回のメタデータ取得で確認
+    for title in SHEET_TITLES:
+        get_or_create_ws(book, title, ws_map)
+
+    # 設定シート
+    settings_ws = get_or_create_ws(book, "設定", ws_map)
+    settings_df = read_values_df(api_retry(settings_ws.get_all_values))
     if settings_df.empty or "項目" not in settings_df.columns or "値" not in settings_df.columns:
         df = pd.DataFrame({"項目": list(DEFAULT_SETTINGS_JP.keys()), "値": list(DEFAULT_SETTINGS_JP.values())})
-        write_ws_df("設定", df)
+        api_retry(settings_ws.clear)
+        api_retry(settings_ws.update, [df.columns.tolist()] + df.values.tolist())
     else:
         current = {str(r["項目"]).strip(): str(r["値"]).strip() for _, r in settings_df.iterrows()}
         changed = False
@@ -225,12 +257,16 @@ def ensure_base_sheets_and_defaults():
                 changed = True
         if changed:
             df = pd.DataFrame({"項目": list(current.keys()), "値": list(current.values())})
-            write_ws_df("設定", df)
+            api_retry(settings_ws.clear)
+            api_retry(settings_ws.update, [df.columns.tolist()] + df.values.tolist())
 
-    system_df = read_ws_df("システム")
+    # システムシート
+    system_ws = get_or_create_ws(book, "システム", ws_map)
+    system_df = read_values_df(api_retry(system_ws.get_all_values))
     if system_df.empty or "key" not in system_df.columns or "value" not in system_df.columns:
         df = pd.DataFrame({"key": list(DEFAULT_SYSTEM_JP.keys()), "value": list(DEFAULT_SYSTEM_JP.values())})
-        write_ws_df("システム", df)
+        api_retry(system_ws.clear)
+        api_retry(system_ws.update, [df.columns.tolist()] + df.values.tolist())
     else:
         current = {str(r["key"]).strip(): str(r["value"]).strip() for _, r in system_df.iterrows()}
         changed = False
@@ -240,11 +276,11 @@ def ensure_base_sheets_and_defaults():
                 changed = True
         if changed:
             df = pd.DataFrame({"key": list(current.keys()), "value": list(current.values())})
-            write_ws_df("システム", df)
+            api_retry(system_ws.clear)
+            api_retry(system_ws.update, [df.columns.tolist()] + df.values.tolist())
 
 
 def load_settings_map() -> dict:
-    ensure_base_sheets_and_defaults()
     df = read_ws_df("設定")
     if df.empty:
         return DEFAULT_SETTINGS_JP.copy()
@@ -260,7 +296,6 @@ def save_settings_map(settings_map: dict):
 
 
 def load_system_map() -> dict:
-    ensure_base_sheets_and_defaults()
     df = read_ws_df("システム")
     if df.empty:
         return DEFAULT_SYSTEM_JP.copy()
