@@ -5,3 +5,4 @@ yfinance
 openpyxl
 gspread
 google-auth
+pandas-market-calendars
