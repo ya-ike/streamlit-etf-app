@@ -17,7 +17,7 @@ import gspread
 import pandas as pd
 import streamlit as st
 
-from signal_engine_v2 import (
+from signal_engine_v3 import (
     now_jst, build_settings_sheet_df, load_excel_settings, jp_settings_to_internal,
     normalize_date_like_text, clean_numeric_series, build_settings_sheet_df,
     download_price_data, run_signal_for_date, apply_same_day_prices
